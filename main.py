@@ -1867,54 +1867,125 @@ def start_driver_trip(
         "status": trip.status,
         "started_at": trip.started_at,
     }
-@app.post("/driver/end-trip")
-def end_driver_trip(
+@app.get("/student/my-bus")
+def get_student_my_bus(
     db: Session = Depends(get_db),
-    current_driver: dict = Depends(require_driver),
+    current_student: dict = Depends(require_student)
 ):
+    # Find student profile
+    student = (
+        db.query(Student)
+        .filter(
+            Student.user_id == current_student["user_id"]
+        )
+        .first()
+    )
+
+    if not student:
+        raise HTTPException(
+            status_code=404,
+            detail="Student profile not found"
+        )
+
+    # Check assigned bus
+    if student.bus_id is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No bus assigned to this student"
+        )
+
+    # Find bus
+    bus = (
+        db.query(Bus)
+        .filter(Bus.id == student.bus_id)
+        .first()
+    )
+
+    if not bus:
+        raise HTTPException(
+            status_code=404,
+            detail="Assigned bus not found"
+        )
+
+    user = db.query(User).filter(
+        User.id == student.user_id
+    ).first()
+
+    route = (
+        db.query(Route)
+        .filter(Route.id == bus.route_id)
+        .first()
+        if bus.route_id
+        else None
+    )
+
     driver = (
         db.query(Driver)
-        .filter(Driver.user_id == current_driver["user_id"])
+        .filter(Driver.id == bus.driver_id)
         .first()
+        if bus.driver_id
+        else None
     )
 
-    if not driver:
-        raise HTTPException(
-            status_code=404,
-            detail="Driver profile not found"
-        )
+    driver_user = (
+        db.query(User)
+        .filter(User.id == driver.user_id)
+        .first()
+        if driver
+        else None
+    )
 
-    trip = (
+    # Check whether this bus currently has an active trip
+    active_trip = (
         db.query(Trip)
         .filter(
-            Trip.driver_id == driver.id,
+            Trip.bus_id == bus.id,
             Trip.status == "active"
         )
-        .order_by(Trip.started_at.desc())
+        .order_by(
+            Trip.started_at.desc()
+        )
         .first()
     )
 
-    if not trip:
-        raise HTTPException(
-            status_code=404,
-            detail="No active trip found"
+    # Latest GPS location
+    location = (
+        db.query(BusLocation)
+        .filter(
+            BusLocation.bus_id == bus.id
         )
-
-    trip.ended_at = datetime.utcnow()
-    trip.status = "completed"
-
-    db.commit()
-    db.refresh(trip)
-    bus = db.query(Bus).filter(Bus.id == trip.bus_id).first()
-    for student in db.query(Student).filter(Student.bus_id == trip.bus_id).all():
-        send_notification(db, student.user_id, "Trip Ended", f"{bus.bus_number if bus else 'Your bus'} has ended its trip.", "trip_ended", {"trip_id": trip.id, "bus_id": trip.bus_id}, related_bus_id=trip.bus_id, related_trip_id=trip.id)
-    send_notification(db, driver.user_id, "Trip Ended", "Your trip has ended and GPS sharing has stopped.", "trip_ended", {"trip_id": trip.id}, related_bus_id=trip.bus_id, related_trip_id=trip.id)
-    db.commit()
+        .order_by(
+            BusLocation.timestamp.desc()
+        )
+        .first()
+    )
 
     return {
-        "message": "Trip ended successfully",
-        "trip_id": trip.id,
-        "status": trip.status,
-        "started_at": trip.started_at,
-        "ended_at": trip.ended_at,
+        "student_id": student.id,
+        "student_name": user.name if user else None,
+        "roll_number": student.roll_number,
+
+        "bus_id": bus.id,
+        "bus_number": bus.bus_number,
+
+        "route_id": bus.route_id,
+        "route_name": route.name if route else None,
+
+        "driver_name": driver_user.name if driver_user else None,
+        "driver_phone": driver_user.phone if driver_user else None,
+
+        "registration_number": bus.registration_number,
+
+        # NEW: tells frontend whether the bus currently has an active trip
+        "active_trip": active_trip is not None,
+
+        "location": (
+            {
+                "latitude": location.latitude,
+                "longitude": location.longitude,
+                "speed": location.speed,
+                "timestamp": location.timestamp
+            }
+            if location else None
+        )
     }
