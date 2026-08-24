@@ -797,87 +797,6 @@ def get_my_bus(
         "route_name": route.name if route else None,
         "route_description": route.description if route else None
     }
-@app.get("/student/my-bus")
-def get_student_my_bus(
-    db: Session = Depends(get_db),
-    current_student: dict = Depends(require_student)
-):
-    # Find student profile
-    student = (
-        db.query(Student)
-        .filter(
-            Student.user_id == current_student["user_id"]
-        )
-        .first()
-    )
-
-    if not student:
-        raise HTTPException(
-            status_code=404,
-            detail="Student profile not found"
-        )
-
-    # Check assigned bus
-    if student.bus_id is None:
-        raise HTTPException(
-            status_code=404,
-            detail="No bus assigned to this student"
-        )
-
-    # Find bus
-    bus = (
-        db.query(Bus)
-        .filter(Bus.id == student.bus_id)
-        .first()
-    )
-
-    if not bus:
-        raise HTTPException(
-            status_code=404,
-            detail="Assigned bus not found"
-        )
-
-    user = db.query(User).filter(User.id == student.user_id).first()
-    route = db.query(Route).filter(Route.id == bus.route_id).first() if bus.route_id else None
-    driver = db.query(Driver).filter(Driver.id == bus.driver_id).first() if bus.driver_id else None
-    driver_user = db.query(User).filter(User.id == driver.user_id).first() if driver else None
-
-    # Latest GPS
-    location = (
-        db.query(BusLocation)
-        .filter(
-            BusLocation.bus_id == bus.id
-        )
-        .order_by(
-            BusLocation.timestamp.desc()
-        )
-        .first()
-    )
-
-    return {
-        "student_id": student.id,
-        "student_name": user.name if user else None,
-        "roll_number": student.roll_number,
-
-        "bus_id": bus.id,
-        "bus_number": bus.bus_number,
-
-        "route_id": bus.route_id,
-        "route_name": route.name if route else None,
-        "driver_name": driver_user.name if driver_user else None,
-        "driver_phone": driver_user.phone if driver_user else None,
-        "registration_number": bus.registration_number,
-
-        "location": (
-            {
-                "latitude": location.latitude,
-                "longitude": location.longitude,
-                "speed": location.speed,
-                "timestamp": location.timestamp
-            }
-            if location else None
-        )
-    }
 @app.get("/student/my-route-stops")
 def get_student_route_stops(
     db: Session = Depends(get_db),
@@ -1537,7 +1456,7 @@ def admin_bus_payload(bus: Bus, db: Session):
                 "latitude": location.latitude,
                 "longitude": location.longitude,
                 "speed": location.speed,
-                "timestamp": location.timestamp
+                "timestamp": location.timestamp.isoformat() + "Z"
             }
             if location else None
         )
