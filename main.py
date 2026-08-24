@@ -1908,3 +1908,88 @@ def get_student_my_bus(
             if location else None
         )
     }
+@app.post("/driver/end-trip")
+def end_driver_trip(
+    db: Session = Depends(get_db),
+    current_driver: dict = Depends(require_driver),
+):
+    driver = (
+        db.query(Driver)
+        .filter(
+            Driver.user_id == current_driver["user_id"]
+        )
+        .first()
+    )
+
+    if not driver:
+        raise HTTPException(
+            status_code=404,
+            detail="Driver profile not found"
+        )
+
+    trip = (
+        db.query(Trip)
+        .filter(
+            Trip.driver_id == driver.id,
+            Trip.status == "active"
+        )
+        .order_by(Trip.started_at.desc())
+        .first()
+    )
+
+    if not trip:
+        raise HTTPException(
+            status_code=404,
+            detail="No active trip found"
+        )
+
+    trip.ended_at = datetime.utcnow()
+    trip.status = "completed"
+
+    db.commit()
+    db.refresh(trip)
+
+    bus = db.query(Bus).filter(
+        Bus.id == trip.bus_id
+    ).first()
+
+    for student in db.query(Student).filter(
+        Student.bus_id == trip.bus_id
+    ).all():
+
+        send_notification(
+            db,
+            student.user_id,
+            "Trip Ended",
+            f"{bus.bus_number if bus else 'Your bus'} has ended its trip.",
+            "trip_ended",
+            {
+                "trip_id": trip.id,
+                "bus_id": trip.bus_id
+            },
+            related_bus_id=trip.bus_id,
+            related_trip_id=trip.id
+        )
+
+    send_notification(
+        db,
+        driver.user_id,
+        "Trip Ended",
+        "Your trip has ended and GPS sharing has stopped.",
+        "trip_ended",
+        {
+            "trip_id": trip.id
+        },
+        related_bus_id=trip.bus_id,
+        related_trip_id=trip.id
+    )
+
+    db.commit()
+
+    return {
+        "message": "Trip ended successfully",
+        "trip_id": trip.id,
+        "status": trip.status,
+        "started_at": trip.started_at,
+        "ended_at": trip.ended_at,
+    }
