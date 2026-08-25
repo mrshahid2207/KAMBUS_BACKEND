@@ -1,8 +1,8 @@
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import inspect, text
-from datetime import date,datetime
-from math import asin, cos, radians, sin, sqrt
+from datetime import datetime, timedelta, date
+from math import asin, cos, radians, sin, sqrt,atan2
 from database import Base, engine, SessionLocal
 from models import (
     User,
@@ -86,7 +86,407 @@ def initialize_trip_database():
             connection.execute(text("ALTER TABLE students ADD COLUMN stop_id INTEGER REFERENCES stops(id)"))
     Notification.__table__.create(bind=engine, checkfirst=True)
     DeviceToken.__table__.create(bind=engine, checkfirst=True)
+# ============================================================
+# KAMBUS WAIT REQUEST CONFIGURATION
+# ============================================================
 
+WAIT_BUDGET_PER_TRIP = 10
+
+WAIT_DRIVER_SKIP_WINDOW_SECONDS = 10
+
+WAIT_MIN_ETA_MINUTES = 1
+WAIT_MAX_ETA_MINUTES = 10
+
+WAIT_RATE_LIMIT_SECONDS = 30
+WAIT_WEEKLY_LIMIT = 3
+
+WAIT_SKIP_COOLDOWN_MINUTES = 15
+
+
+# ============================================================
+# DISTANCE HELPER
+# ============================================================
+
+from math import radians, sin, cos, sqrt, atan2
+
+
+def haversine_km(
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float
+) -> float:
+
+    earth_radius_km = 6371.0
+
+    d_lat = radians(
+        lat2 - lat1
+    )
+
+    d_lon = radians(
+        lon2 - lon1
+    )
+
+    a = (
+        sin(d_lat / 2) ** 2
+        +
+        cos(radians(lat1))
+        *
+        cos(radians(lat2))
+        *
+        sin(d_lon / 2) ** 2
+    )
+
+    c = 2 * atan2(
+        sqrt(a),
+        sqrt(1 - a)
+    )
+
+    return earth_radius_km * c
+
+
+# ============================================================
+# ACTIVE TRIP
+# ============================================================
+
+def get_active_trip_for_bus(
+    db: Session,
+    bus_id: int
+):
+
+    return (
+        db.query(Trip)
+        .filter(
+            Trip.bus_id == bus_id,
+            Trip.status == "active"
+        )
+        .order_by(
+            Trip.started_at.desc()
+        )
+        .first()
+    )
+
+
+# ============================================================
+# LATEST BUS LOCATION
+# ============================================================
+
+def get_latest_location(
+    db: Session,
+    bus_id: int,
+    trip_id: int | None = None
+):
+
+    query = (
+        db.query(BusLocation)
+        .filter(
+            BusLocation.bus_id == bus_id
+        )
+    )
+
+    if trip_id is not None:
+
+        query = query.filter(
+            BusLocation.trip_id == trip_id
+        )
+
+    return (
+        query
+        .order_by(
+            BusLocation.timestamp.desc()
+        )
+        .first()
+    )
+
+
+# ============================================================
+# STUDENT TRAVEL STATUS
+# ============================================================
+
+def student_is_travelling_today(
+    db: Session,
+    student_id: int
+) -> bool:
+
+    today = date.today()
+
+    status = (
+        db.query(TravelStatus)
+        .filter(
+            TravelStatus.student_id == student_id,
+            TravelStatus.date == today
+        )
+        .order_by(
+            TravelStatus.created_at.desc()
+        )
+        .first()
+    )
+
+    # No status record = student has not opted out
+    if status is None:
+        return True
+
+    return status.status == "travelling"
+# ============================================================
+# ETA TO STUDENT STOP
+# ============================================================
+
+def get_eta_minutes_to_stop(
+    db: Session,
+    bus_id: int,
+    trip_id: int,
+    stop: Stop
+):
+
+    location = get_latest_location(
+        db,
+        bus_id,
+        trip_id
+    )
+
+    if not location:
+        return None
+
+
+    distance_km = haversine_km(
+        location.latitude,
+        location.longitude,
+        stop.latitude,
+        stop.longitude
+    )
+
+
+    speed = location.speed
+
+
+    # If current speed is unavailable or zero,
+    # look for the most recent positive speed.
+
+    if speed is None or speed <= 0:
+
+        previous_location = (
+            db.query(BusLocation)
+            .filter(
+                BusLocation.bus_id == bus_id,
+                BusLocation.trip_id == trip_id,
+                BusLocation.speed.isnot(None),
+                BusLocation.speed > 0,
+                BusLocation.timestamp <= location.timestamp
+            )
+            .order_by(
+                BusLocation.timestamp.desc()
+            )
+            .first()
+        )
+
+        if previous_location:
+
+            speed = previous_location.speed
+
+
+    if speed is None or speed <= 0:
+
+        return None
+
+
+    metres_per_minute = (
+        speed * 1000 / 60
+    )
+
+
+    minutes = (
+        distance_km * 1000
+    ) / metres_per_minute
+
+
+    return max(
+        1,
+        int(minutes + 0.999)
+    )
+
+
+# ============================================================
+# CHECK WHETHER BUS PASSED STUDENT STOP
+# ============================================================
+
+def has_passed_stop(
+    db: Session,
+    trip: Trip,
+    stop: Stop
+) -> bool:
+
+    location = get_latest_location(
+        db,
+        trip.bus_id,
+        trip.id
+    )
+
+    if not location:
+        return False
+
+
+    route_stops = (
+        db.query(Stop)
+        .filter(
+            Stop.route_id == trip.route_id
+        )
+        .order_by(
+            Stop.stop_order.asc()
+        )
+        .all()
+    )
+
+
+    if not route_stops:
+        return False
+
+
+    nearest_stop = None
+    nearest_distance = float("inf")
+
+
+    for route_stop in route_stops:
+
+        distance = haversine_km(
+            location.latitude,
+            location.longitude,
+            route_stop.latitude,
+            route_stop.longitude
+        )
+
+
+        if distance < nearest_distance:
+
+            nearest_distance = distance
+            nearest_stop = route_stop
+
+
+    if not nearest_stop:
+        return False
+
+
+    return (
+        nearest_stop.stop_order >
+        stop.stop_order
+    )
+
+
+# ============================================================
+# ACTIVE REQUEST CHECK
+# ============================================================
+
+def active_student_request_exists(
+    db: Session,
+    student_id: int,
+    trip_id: int
+) -> bool:
+
+    request = (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.student_id == student_id,
+            WaitRequest.trip_id == trip_id,
+            WaitRequest.status.in_([
+                "pending",
+                "accepted"
+            ])
+        )
+        .first()
+    )
+
+    return request is not None
+
+
+# ============================================================
+# RATE LIMIT
+# ============================================================
+
+def student_rate_limited(
+    db: Session,
+    student_id: int
+) -> bool:
+
+    cutoff = (
+        datetime.utcnow()
+        -
+        timedelta(
+            seconds=WAIT_RATE_LIMIT_SECONDS
+        )
+    )
+
+
+    request = (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.student_id == student_id,
+            WaitRequest.created_at >= cutoff
+        )
+        .first()
+    )
+
+
+    return request is not None
+
+
+# ============================================================
+# WEEKLY LIMIT
+# ============================================================
+
+def weekly_wait_limit_reached(
+    db: Session,
+    student_id: int
+) -> bool:
+
+    cutoff = (
+        datetime.utcnow()
+        -
+        timedelta(days=7)
+    )
+
+
+    count = (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.student_id == student_id,
+            WaitRequest.created_at >= cutoff
+        )
+        .count()
+    )
+
+
+    return count >= WAIT_WEEKLY_LIMIT
+
+
+# ============================================================
+# DRIVER SKIP COOLDOWN
+# ============================================================
+
+def active_skip_cooldown(
+    db: Session,
+    student_id: int,
+    trip_id: int
+) -> bool:
+
+    now = datetime.utcnow()
+
+
+    request = (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.student_id == student_id,
+            WaitRequest.trip_id == trip_id,
+            WaitRequest.status == "rejected",
+            WaitRequest.cooldown_until.isnot(None),
+            WaitRequest.cooldown_until > now
+        )
+        .order_by(
+            WaitRequest.created_at.desc()
+        )
+        .first()
+    )
+
+
+    return request is not None
 @app.get("/")
 def root():
     return {
@@ -520,37 +920,173 @@ def get_bus_location(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    # Students may read only the live location of their assigned bus. Drivers
-    # may read only their own bus; admins retain operational visibility.
+    # ========================================
+    # ACCESS CONTROL
+    # ========================================
+
     if current_user["role"] == "student":
-        student = db.query(Student).filter(Student.user_id == current_user["user_id"]).first()
-        if not student or student.bus_id != bus_id:
-            raise HTTPException(status_code=403, detail="You are not assigned to this bus")
+
+        student = (
+            db.query(Student)
+            .filter(
+                Student.user_id ==
+                current_user["user_id"]
+            )
+            .first()
+        )
+
+        if (
+            not student
+            or student.bus_id != bus_id
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="You are not assigned to this bus"
+            )
+
+
     elif current_user["role"] == "driver":
-        driver = db.query(Driver).filter(Driver.user_id == current_user["user_id"]).first()
-        if not driver or not db.query(Bus).filter(Bus.id == bus_id, Bus.driver_id == driver.id).first():
-            raise HTTPException(status_code=403, detail="You are not assigned to this bus")
+
+        driver = (
+            db.query(Driver)
+            .filter(
+                Driver.user_id ==
+                current_user["user_id"]
+            )
+            .first()
+        )
+
+        if (
+            not driver
+            or not db.query(Bus).filter(
+                Bus.id == bus_id,
+                Bus.driver_id == driver.id
+            ).first()
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="You are not assigned to this bus"
+            )
+
+
     elif current_user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Invalid role")
+
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid role"
+        )
+
+
+    # ========================================
+    # LATEST LOCATION
+    # ========================================
+
     location = (
         db.query(BusLocation)
-        .filter(BusLocation.bus_id == bus_id)
-        .order_by(BusLocation.timestamp.desc())
+        .filter(
+            BusLocation.bus_id == bus_id
+        )
+        .order_by(
+            BusLocation.timestamp.desc()
+        )
         .first()
     )
 
+
     if not location:
+
         raise HTTPException(
             status_code=404,
             detail="No location found for this bus"
         )
 
+
+    # ========================================
+    # ACTIVE WAIT STATE
+    # ========================================
+
+    active_wait = (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.trip_id == location.trip_id,
+            WaitRequest.bus_id == bus_id,
+            WaitRequest.status == "accepted",
+            WaitRequest.wait_until.isnot(None),
+            WaitRequest.wait_until > datetime.utcnow()
+        )
+        .order_by(
+            WaitRequest.wait_until.desc()
+        )
+        .first()
+        if location.trip_id
+        else None
+    )
+
+
+    # ========================================
+    # WAIT INFORMATION
+    # ========================================
+
+    wait_remaining_seconds = None
+    wait_stop_id = None
+    wait_minutes = None
+
+
+    if active_wait:
+
+        wait_remaining_seconds = max(
+            0,
+            int(
+                (
+                    active_wait.wait_until -
+                    datetime.utcnow()
+                ).total_seconds()
+            )
+        )
+
+        wait_stop_id = (
+            active_wait.stop_id
+        )
+
+        wait_minutes = (
+            active_wait.minutes
+        )
+
+
+    # ========================================
+    # RESPONSE
+    # ========================================
+
     return {
-        "bus_id": bus_id,
-        "latitude": location.latitude,
-        "longitude": location.longitude,
-        "speed": location.speed,
-        "timestamp": location.timestamp
+        "bus_id":
+            bus_id,
+
+        "latitude":
+            location.latitude,
+
+        "longitude":
+            location.longitude,
+
+        "speed":
+            location.speed,
+
+        "timestamp":
+            location.timestamp,
+
+        "trip_id":
+            location.trip_id,
+
+        "is_waiting":
+            active_wait is not None,
+
+        "wait_remaining_seconds":
+            wait_remaining_seconds,
+
+        "wait_stop_id":
+            wait_stop_id,
+
+        "wait_minutes":
+            wait_minutes
     }
 @app.post("/drivers")
 def create_driver(
@@ -891,19 +1427,26 @@ def get_student_my_stop(
         "bus_id": bus.id,
         "bus_number": bus.bus_number,
     }
-
-
 @app.post("/student/wait-request")
 def create_wait_request(
     data: WaitRequestCreate,
     db: Session = Depends(get_db),
     current_student: dict = Depends(require_student)
 ):
-    if data.minutes <= 0:
+    # ========================================
+    # BASIC VALIDATION
+    # ========================================
+
+    if data.minutes <= 0 or data.minutes > 4:
         raise HTTPException(
             status_code=400,
-            detail="Wait time must be greater than 0"
+            detail="Wait time must be between 1 and 4 minutes"
         )
+
+
+    # ========================================
+    # FIND STUDENT
+    # ========================================
 
     student = (
         db.query(Student)
@@ -918,6 +1461,11 @@ def create_wait_request(
             status_code=404,
             detail="Student profile not found"
         )
+
+
+    # ========================================
+    # BUS ASSIGNMENT
+    # ========================================
 
     if student.bus_id is None:
         raise HTTPException(
@@ -925,52 +1473,440 @@ def create_wait_request(
             detail="No bus assigned to this student"
         )
 
-    # Prevent multiple pending requests
-    existing_request = (
-        db.query(WaitRequest)
+
+    # ========================================
+    # STOP ASSIGNMENT
+    # ========================================
+
+    if student.stop_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No stop assigned to this student"
+        )
+
+
+    # ========================================
+    # TRAVEL STATUS
+    # ========================================
+
+    if not student_is_travelling_today(
+        db,
+        student.id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="You marked yourself as not travelling today"
+        )
+
+
+    # ========================================
+    # FIND ACTIVE TRIP
+    # ========================================
+
+    trip = get_active_trip_for_bus(
+        db,
+        student.bus_id
+    )
+
+    if not trip:
+        raise HTTPException(
+            status_code=400,
+            detail="No active bus trip right now"
+        )
+
+
+    # ========================================
+    # FIND ASSIGNED STOP
+    # ========================================
+
+    stop = (
+        db.query(Stop)
         .filter(
-            WaitRequest.student_id == student.id,
-            WaitRequest.bus_id == student.bus_id,
-            WaitRequest.status == "pending"
+            Stop.id == student.stop_id
         )
         .first()
     )
 
-    if existing_request:
+    if not stop:
+        raise HTTPException(
+            status_code=404,
+            detail="Assigned stop not found"
+        )
+
+
+    # ========================================
+    # CHECK WHETHER BUS PASSED STOP
+    # ========================================
+
+    if has_passed_stop(
+        db,
+        trip,
+        stop
+    ):
         raise HTTPException(
             status_code=400,
-            detail="You already have a pending wait request"
+            detail="The bus has already passed your stop"
         )
+
+
+    # ========================================
+    # CALCULATE LIVE ETA
+    # ========================================
+
+    eta_minutes = get_eta_minutes_to_stop(
+        db,
+        student.bus_id,
+        trip.id,
+        stop
+    )
+
+
+    if eta_minutes is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Live ETA is currently unavailable"
+        )
+
+
+    # ========================================
+    # ETA MUST BE BETWEEN 1 AND 10 MINUTES
+    # ========================================
+
+    if (
+        eta_minutes < WAIT_MIN_ETA_MINUTES
+        or
+        eta_minutes > WAIT_MAX_ETA_MINUTES
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Wait requests are available only "
+                "when your bus ETA is between "
+                f"{WAIT_MIN_ETA_MINUTES} and "
+                f"{WAIT_MAX_ETA_MINUTES} minutes. "
+                f"Current ETA: {eta_minutes} minutes."
+            )
+        )
+
+
+    # ========================================
+    # ONE ACTIVE REQUEST PER STUDENT / TRIP
+    # ========================================
+
+    if active_student_request_exists(
+        db,
+        student.id,
+        trip.id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "You already have an active wait request "
+                "for this trip"
+            )
+        )
+
+
+    # ========================================
+    # DRIVER-SKIP COOLDOWN
+    # ========================================
+
+    if active_skip_cooldown(
+        db,
+        student.id,
+        trip.id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "You recently had a wait request skipped "
+                "by the driver. Please try again later."
+            )
+        )
+
+
+    # ========================================
+    # API RATE LIMIT
+    # ========================================
+
+    if student_rate_limited(
+        db,
+        student.id
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Please wait 30 seconds before "
+                "requesting another wait."
+            )
+        )
+
+
+    # ========================================
+    # WEEKLY ANTI-ABUSE LIMIT
+    # ========================================
+
+    if weekly_wait_limit_reached(
+        db,
+        student.id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Your weekly wait-request limit "
+                "has been reached."
+            )
+        )
+
+
+    # ========================================
+    # TRIP WAIT BUDGET
+    # ========================================
+
+    remaining_budget = (
+        trip.wait_budget_total
+        -
+        trip.wait_budget_used
+    )
+
+
+    if remaining_budget <= 0:
+
+        send_notification(
+            db,
+            current_student["user_id"],
+            "Wait unavailable",
+            "The bus can't wait further today.",
+            "wait_budget_exhausted",
+            {
+                "trip_id": trip.id,
+                "bus_id": trip.bus_id
+            },
+            related_bus_id=trip.bus_id,
+            related_trip_id=trip.id
+        )
+
+        db.commit()
+
+        raise HTTPException(
+            status_code=400,
+            detail="The bus can't wait further today."
+        )
+
+
+    # ========================================
+    # GROUP BY TRIP + STOP
+    # ========================================
+
+    existing_group_requests = (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.trip_id == trip.id,
+            WaitRequest.stop_id == stop.id,
+            WaitRequest.status == "pending"
+        )
+        .all()
+    )
+
+
+    existing_group_max = max(
+        [
+            request.minutes
+            for request in existing_group_requests
+        ],
+        default=0
+    )
+
+
+    # MAX requested time among students
+    grouped_requested_minutes = max(
+        existing_group_max,
+        data.minutes
+    )
+
+
+    # ========================================
+    # GROUP MUST FIT REMAINING BUDGET
+    # ========================================
+
+    if grouped_requested_minutes > remaining_budget:
+
+        send_notification(
+            db,
+            current_student["user_id"],
+            "Wait unavailable",
+            "The bus can't wait further today.",
+            "wait_budget_exhausted",
+            {
+                "trip_id": trip.id,
+                "bus_id": trip.bus_id,
+                "remaining_budget": remaining_budget
+            },
+            related_bus_id=trip.bus_id,
+            related_trip_id=trip.id
+        )
+
+        db.commit()
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The bus has insufficient remaining "
+                "wait buffer today."
+            )
+        )
+
+
+    # ========================================
+    # CREATE WAIT REQUEST
+    # ========================================
+
+    now = datetime.utcnow()
 
     wait_request = WaitRequest(
         student_id=student.id,
         bus_id=student.bus_id,
+        trip_id=trip.id,
+        stop_id=stop.id,
         minutes=data.minutes,
-        status="pending"
+        status="pending",
+        created_at=now,
+        auto_accept_at=(
+            now +
+            timedelta(
+                seconds=WAIT_DRIVER_SKIP_WINDOW_SECONDS
+            )
+        )
     )
 
-    db.add(wait_request)
+
+    db.add(
+        wait_request
+    )
+
     db.commit()
-    db.refresh(wait_request)
-    bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
-    driver = db.query(Driver).filter(Driver.id == bus.driver_id).first() if bus and bus.driver_id else None
+    db.refresh(
+        wait_request
+    )
+
+
+    # ========================================
+    # FIND DRIVER
+    # ========================================
+
+    bus = (
+        db.query(Bus)
+        .filter(
+            Bus.id == student.bus_id
+        )
+        .first()
+    )
+
+
+    driver = (
+        db.query(Driver)
+        .filter(
+            Driver.id == bus.driver_id
+        )
+        .first()
+        if bus and bus.driver_id
+        else None
+    )
+
+
+    # ========================================
+    # NOTIFY DRIVER
+    # ========================================
+
     if driver:
-        send_notification(db, driver.user_id, "New Wait Request", f"A student requested a {wait_request.minutes} minute wait.", "wait_request", {"wait_request_id": wait_request.id}, related_bus_id=student.bus_id, related_wait_request_id=wait_request.id)
-        db.commit()
+
+        grouped_count = (
+            len(existing_group_requests) +
+            1
+        )
+
+        student_word = (
+            "student"
+            if grouped_count == 1
+            else "students"
+        )
+
+        message = (
+            f"{grouped_count} {student_word} at "
+            f"{stop.name} — waiting "
+            f"{grouped_requested_minutes} min."
+        )
+
+
+        send_notification(
+            db,
+            driver.user_id,
+            "Bus Wait Request",
+            message,
+            "wait_request",
+            {
+                "trip_id": trip.id,
+                "stop_id": stop.id,
+                "minutes": grouped_requested_minutes,
+                "student_count": grouped_count,
+                "wait_request_id": wait_request.id,
+                "action": "skip_only"
+            },
+            related_bus_id=student.bus_id,
+            related_trip_id=trip.id,
+            related_wait_request_id=wait_request.id
+        )
+
+
+    db.commit()
+
+
+    # ========================================
+    # RESPONSE
+    # ========================================
 
     return {
-        "message": "Wait request sent successfully",
-        "request_id": wait_request.id,
-        "student_id": student.id,
-        "bus_id": student.bus_id,
-        "minutes": wait_request.minutes,
-        "status": wait_request.status
+        "message": "Wait request created",
+
+        "request_id":
+            wait_request.id,
+
+        "student_id":
+            student.id,
+
+        "bus_id":
+            student.bus_id,
+
+        "trip_id":
+            trip.id,
+
+        "stop_id":
+            stop.id,
+
+        "minutes":
+            wait_request.minutes,
+
+        "grouped_minutes":
+            grouped_requested_minutes,
+
+        "eta_minutes":
+            eta_minutes,
+
+        "status":
+            wait_request.status,
+
+        "auto_accept_at":
+            wait_request.auto_accept_at
     }
 @app.get("/student/wait-request/status")
 def get_wait_request_status(
     db: Session = Depends(get_db),
     current_student: dict = Depends(require_student)
 ):
+    # ========================================
+    # FIND STUDENT
+    # ========================================
+
     student = (
         db.query(Student)
         .filter(
@@ -985,14 +1921,22 @@ def get_wait_request_status(
             detail="Student profile not found"
         )
 
+
+    # ========================================
+    # FIND LATEST WAIT REQUEST
+    # ========================================
+
     wait_request = (
         db.query(WaitRequest)
         .filter(
             WaitRequest.student_id == student.id
         )
-        .order_by(WaitRequest.created_at.desc())
+        .order_by(
+            WaitRequest.created_at.desc()
+        )
         .first()
     )
+
 
     if not wait_request:
         raise HTTPException(
@@ -1000,12 +1944,107 @@ def get_wait_request_status(
             detail="No wait request found"
         )
 
+
+    # ========================================
+    # FIND RELATED TRIP
+    # ========================================
+
+    trip = None
+
+    if wait_request.trip_id:
+
+        trip = (
+            db.query(Trip)
+            .filter(
+                Trip.id == wait_request.trip_id
+            )
+            .first()
+        )
+
+
+    # ========================================
+    # RECONCILE PENDING REQUEST
+    # ========================================
+
+    if (
+        trip
+        and
+        trip.status == "active"
+    ):
+
+        reconcile_wait_requests(
+            db,
+            trip
+        )
+
+        db.refresh(
+            wait_request
+        )
+
+
+    # ========================================
+    # AUTO-COMPLETE ACCEPTED WAIT
+    # ========================================
+
+    if (
+        wait_request.status == "accepted"
+        and
+        wait_request.wait_until is not None
+        and
+        wait_request.wait_until <= datetime.utcnow()
+    ):
+
+        wait_request.status = "completed"
+
+        db.commit()
+
+        db.refresh(
+            wait_request
+        )
+
+
+    # ========================================
+    # RESPONSE
+    # ========================================
+
     return {
-        "request_id": wait_request.id,
-        "minutes": wait_request.minutes,
-        "status": wait_request.status,
-        "created_at": wait_request.created_at
+        "request_id":
+            wait_request.id,
+
+        "student_id":
+            wait_request.student_id,
+
+        "bus_id":
+            wait_request.bus_id,
+
+        "trip_id":
+            wait_request.trip_id,
+
+        "stop_id":
+            wait_request.stop_id,
+
+        "minutes":
+            wait_request.minutes,
+
+        "status":
+            wait_request.status,
+
+        "created_at":
+            wait_request.created_at,
+
+        "auto_accept_at":
+            wait_request.auto_accept_at,
+
+        "wait_until":
+            wait_request.wait_until,
+
+        "skipped_at":
+            wait_request.skipped_at,
+
+        "cooldown_until":
+            wait_request.cooldown_until
     }
+
 @app.get("/driver/wait-requests")
 def get_driver_wait_requests(
     db: Session = Depends(get_db),
@@ -1013,7 +2052,9 @@ def get_driver_wait_requests(
 ):
     driver = (
         db.query(Driver)
-        .filter(Driver.user_id == current_driver["user_id"])
+        .filter(
+            Driver.user_id == current_driver["user_id"]
+        )
         .first()
     )
 
@@ -1025,7 +2066,9 @@ def get_driver_wait_requests(
 
     bus = (
         db.query(Bus)
-        .filter(Bus.driver_id == driver.id)
+        .filter(
+            Bus.driver_id == driver.id
+        )
         .first()
     )
 
@@ -1035,39 +2078,418 @@ def get_driver_wait_requests(
             detail="No bus assigned to this driver"
         )
 
-    requests = (
+    trip = get_active_trip_for_bus(
+        db,
+        bus.id
+    )
+
+    if not trip:
+        return {
+            "bus_id": bus.id,
+            "bus_number": bus.bus_number,
+            "requests": []
+        }
+
+    now = datetime.utcnow()
+
+    # ====================================================
+    # 1. AUTO-ACCEPT EXPIRED PENDING REQUEST GROUPS
+    # ====================================================
+
+    pending_requests = (
         db.query(WaitRequest)
         .filter(
             WaitRequest.bus_id == bus.id,
+            WaitRequest.trip_id == trip.id,
             WaitRequest.status == "pending"
         )
-        .order_by(WaitRequest.created_at.asc())
+        .order_by(
+            WaitRequest.created_at.asc()
+        )
         .all()
     )
 
-    result = []
+    grouped = {}
 
-    for request in requests:
+    for request in pending_requests:
 
-        student = (
-            db.query(Student)
-            .filter(Student.id == request.student_id)
+        if request.stop_id is None:
+            continue
+
+        key = (
+            request.trip_id,
+            request.stop_id
+        )
+
+        grouped.setdefault(
+            key,
+            []
+        ).append(
+            request
+        )
+
+    for key, group in grouped.items():
+
+        # Still inside driver's 10-second override window
+        group_deadline = max(
+            (
+                request.auto_accept_at
+                for request in group
+                if request.auto_accept_at
+            ),
+            default=None
+        )
+
+        if (
+            group_deadline is not None
+            and group_deadline > now
+        ):
+            continue
+
+        stop_id = key[1]
+
+        stop = (
+            db.query(Stop)
+            .filter(
+                Stop.id == stop_id
+            )
             .first()
         )
 
+        if not stop:
+            continue
+
+        # ====================================================
+        # CHECK IF BUS ALREADY PASSED THE STOP
+        # ====================================================
+
+        if has_passed_stop(
+            db,
+            trip,
+            stop
+        ):
+
+            for request in group:
+
+                request.status = "rejected"
+
+                request.skipped_at = now
+
+                request.cooldown_until = (
+                    now +
+                    timedelta(
+                        minutes=
+                            WAIT_SKIP_COOLDOWN_MINUTES
+                    )
+                )
+
+                student = (
+                    db.query(Student)
+                    .filter(
+                        Student.id ==
+                            request.student_id
+                    )
+                    .first()
+                )
+
+                if student:
+
+                    send_notification(
+                        db,
+                        student.user_id,
+                        "Wait Request Cancelled",
+                        "The bus has already passed your stop.",
+                        "wait_rejected",
+                        {
+                            "wait_request_id":
+                                request.id,
+
+                            "trip_id":
+                                trip.id,
+
+                            "stop_id":
+                                stop.id
+                        },
+                        related_bus_id=bus.id,
+                        related_trip_id=trip.id,
+                        related_wait_request_id=request.id
+                    )
+
+            continue
+
+        # ====================================================
+        # GROUP MAX REQUESTED TIME
+        # ====================================================
+
+        requested_minutes = max(
+            request.minutes
+            for request in group
+        )
+
+        remaining_budget = (
+            trip.wait_budget_total
+            -
+            trip.wait_budget_used
+        )
+
+        # ====================================================
+        # BUDGET EXHAUSTED / INSUFFICIENT
+        # ====================================================
+
+        if (
+            remaining_budget <= 0
+            or requested_minutes > remaining_budget
+        ):
+
+            for request in group:
+
+                request.status = "rejected"
+
+                student = (
+                    db.query(Student)
+                    .filter(
+                        Student.id ==
+                            request.student_id
+                    )
+                    .first()
+                )
+
+                if student:
+
+                    send_notification(
+                        db,
+                        student.user_id,
+                        "Wait unavailable",
+                        "The bus can't wait further today.",
+                        "wait_budget_exhausted",
+                        {
+                            "wait_request_id":
+                                request.id,
+
+                            "trip_id":
+                                trip.id,
+
+                            "stop_id":
+                                stop.id,
+
+                            "remaining_budget":
+                                remaining_budget
+                        },
+                        related_bus_id=bus.id,
+                        related_trip_id=trip.id,
+                        related_wait_request_id=request.id
+                    )
+
+            continue
+
+        # ====================================================
+        # AUTO ACCEPT GROUP
+        # ====================================================
+
+        trip.wait_budget_used += requested_minutes
+
+        wait_until = (
+            now +
+            timedelta(
+                minutes=requested_minutes
+            )
+        )
+
+        for request in group:
+
+            request.status = "accepted"
+
+            request.wait_until = wait_until
+
+            student = (
+                db.query(Student)
+                .filter(
+                    Student.id ==
+                        request.student_id
+                )
+                .first()
+            )
+
+            if student:
+
+                send_notification(
+                    db,
+                    student.user_id,
+                    "Wait Request Accepted",
+                    (
+                        f"The bus will wait approximately "
+                        f"{requested_minutes} minute"
+                        f"{'s' if requested_minutes != 1 else ''} "
+                        f"at {stop.name}."
+                    ),
+                    "wait_accepted",
+                    {
+                        "wait_request_id":
+                            request.id,
+
+                        "trip_id":
+                            trip.id,
+
+                        "stop_id":
+                            stop.id,
+
+                        "minutes":
+                            requested_minutes,
+
+                        "wait_until":
+                            wait_until.isoformat()
+                    },
+                    related_bus_id=bus.id,
+                    related_trip_id=trip.id,
+                    related_wait_request_id=request.id
+                )
+
+    db.commit()
+
+    # ====================================================
+    # 2. BUILD DRIVER VIEW
+    # ====================================================
+
+    pending_requests = (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.bus_id == bus.id,
+            WaitRequest.trip_id == trip.id,
+            WaitRequest.status == "pending"
+        )
+        .order_by(
+            WaitRequest.created_at.asc()
+        )
+        .all()
+    )
+
+    grouped = {}
+
+    for request in pending_requests:
+
+        if request.stop_id is None:
+            continue
+
+        key = (
+            request.trip_id,
+            request.stop_id
+        )
+
+        grouped.setdefault(
+            key,
+            []
+        ).append(
+            request
+        )
+
+    result = []
+
+    for key, group in grouped.items():
+
+        stop_id = key[1]
+
+        stop = (
+            db.query(Stop)
+            .filter(
+                Stop.id == stop_id
+            )
+            .first()
+        )
+
+        if not stop:
+            continue
+
+        requested_minutes = max(
+            request.minutes
+            for request in group
+        )
+
+        earliest_deadline = min(
+            (
+                request.auto_accept_at
+                for request in group
+                if request.auto_accept_at
+            ),
+            default=None
+        )
+
+        students = []
+
+        for request in group:
+
+            student = (
+                db.query(Student)
+                .filter(
+                    Student.id ==
+                        request.student_id
+                )
+                .first()
+            )
+
+            students.append({
+                "request_id":
+                    request.id,
+
+                "student_id":
+                    request.student_id,
+
+                "roll_number":
+                    student.roll_number
+                    if student
+                    else None
+            })
+
         result.append({
-            "request_id": request.id,
-            "student_id": request.student_id,
-            "roll_number": student.roll_number if student else None,
-            "minutes": request.minutes,
-            "status": request.status,
-            "created_at": request.created_at
+            "trip_id":
+                trip.id,
+
+            "stop_id":
+                stop.id,
+
+            "stop_name":
+                stop.name,
+
+            "student_count":
+                len(group),
+
+            "minutes":
+                requested_minutes,
+
+            "auto_accept_at":
+                earliest_deadline,
+
+            "action":
+                "skip_only",
+
+            "students":
+                students
         })
 
     return {
-        "bus_id": bus.id,
-        "bus_number": bus.bus_number,
-        "requests": result
+        "bus_id":
+            bus.id,
+
+        "bus_number":
+            bus.bus_number,
+
+        "trip_id":
+            trip.id,
+
+        "wait_budget_total":
+            trip.wait_budget_total,
+
+        "wait_budget_used":
+            trip.wait_budget_used,
+
+        "wait_budget_remaining":
+            max(
+                0,
+                trip.wait_budget_total -
+                trip.wait_budget_used
+            ),
+
+        "requests":
+            result
     }
 @app.post("/driver/wait-request/{request_id}/accept")
 def accept_wait_request(
@@ -1346,17 +2768,25 @@ def get_travel_status(
             TravelStatus.student_id == student.id,
             TravelStatus.date == date.today()
         )
+        .order_by(
+            TravelStatus.created_at.desc()
+        )
         .first()
     )
 
+    # No status saved for today.
+    # Treat student as travelling by default.
+    if travel_status is None:
+        return {
+            "student_id": student.id,
+            "status": "travelling",
+            "date": date.today()
+        }
+
     return {
         "student_id": student.id,
-        "status": (
-            travel_status.status
-            if travel_status
-            else "not_travelling"
-        ),
-        "date": date.today()
+        "status": travel_status.status,
+        "date": travel_status.date
     }
 @app.get("/admin/students")
 def get_all_students(
@@ -1764,12 +3194,13 @@ def start_driver_trip(
         }
 
     trip = Trip(
-        bus_id=bus.id,
-        driver_id=driver.id,
-        route_id=bus.route_id,
-        status="active",
+    bus_id=bus.id,
+    driver_id=driver.id,
+    route_id=bus.route_id,
+    status="active",
+    wait_budget_total=10,
+    wait_budget_used=0,
     )
-
     db.add(trip)
     db.commit()
     db.refresh(trip)
@@ -1993,3 +3424,549 @@ def end_driver_trip(
         "started_at": trip.started_at,
         "ended_at": trip.ended_at,
     }
+@app.post("/driver/wait-request/{request_id}/skip")
+def skip_wait_request(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_driver: dict = Depends(require_driver)
+):
+    # ========================================
+    # FIND DRIVER
+    # ========================================
+
+    driver = (
+        db.query(Driver)
+        .filter(
+            Driver.user_id == current_driver["user_id"]
+        )
+        .first()
+    )
+
+    if not driver:
+        raise HTTPException(
+            status_code=404,
+            detail="Driver profile not found"
+        )
+
+
+    # ========================================
+    # FIND ASSIGNED BUS
+    # ========================================
+
+    bus = (
+        db.query(Bus)
+        .filter(
+            Bus.driver_id == driver.id
+        )
+        .first()
+    )
+
+    if not bus:
+        raise HTTPException(
+            status_code=404,
+            detail="No bus assigned to this driver"
+        )
+
+
+    # ========================================
+    # FIND ACTIVE TRIP
+    # ========================================
+
+    trip = get_active_trip_for_bus(
+        db,
+        bus.id
+    )
+
+    if not trip:
+        raise HTTPException(
+            status_code=400,
+            detail="No active trip"
+        )
+
+
+    # ========================================
+    # FIND REQUEST
+    # ========================================
+
+    request = (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.id == request_id,
+            WaitRequest.bus_id == bus.id,
+            WaitRequest.trip_id == trip.id,
+            WaitRequest.status == "pending"
+        )
+        .first()
+    )
+
+    if not request:
+        raise HTTPException(
+            status_code=404,
+            detail="Pending wait request not found"
+        )
+
+
+    # ========================================
+    # REQUEST MUST BELONG TO A STOP
+    # ========================================
+
+    if request.stop_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Wait request has no assigned stop"
+        )
+
+
+    # ========================================
+    # FIND ALL REQUESTS IN SAME GROUP
+    # trip_id + stop_id
+    # ========================================
+
+    grouped_requests = (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.trip_id == trip.id,
+            WaitRequest.stop_id == request.stop_id,
+            WaitRequest.status == "pending"
+        )
+        .all()
+    )
+
+    if not grouped_requests:
+        raise HTTPException(
+            status_code=400,
+            detail="No pending requests in this group"
+        )
+
+
+    # ========================================
+    # SKIP TIME / COOLDOWN
+    # ========================================
+
+    now = datetime.utcnow()
+
+    cooldown_until = (
+        now +
+        timedelta(
+            minutes=WAIT_SKIP_COOLDOWN_MINUTES
+        )
+    )
+
+
+    # ========================================
+    # FIND STOP
+    # ========================================
+
+    stop = (
+        db.query(Stop)
+        .filter(
+            Stop.id == request.stop_id
+        )
+        .first()
+    )
+
+    stop_name = (
+        stop.name
+        if stop
+        else "your stop"
+    )
+
+
+    affected_students = []
+
+
+    # ========================================
+    # REJECT ENTIRE GROUP
+    # ========================================
+
+    for grouped_request in grouped_requests:
+
+        grouped_request.status = "rejected"
+
+        grouped_request.skipped_at = now
+
+        grouped_request.cooldown_until = (
+            cooldown_until
+        )
+
+
+        student = (
+            db.query(Student)
+            .filter(
+                Student.id ==
+                    grouped_request.student_id
+            )
+            .first()
+        )
+
+
+        if student:
+
+            affected_students.append(
+                student.id
+            )
+
+
+            send_notification(
+                db,
+                student.user_id,
+                "Wait Request Skipped",
+                (
+                    f"The driver skipped the wait request "
+                    f"at {stop_name}. "
+                    f"You may request again after the cooldown."
+                ),
+                "wait_rejected",
+                {
+                    "wait_request_id":
+                        grouped_request.id,
+
+                    "trip_id":
+                        trip.id,
+
+                    "stop_id":
+                        request.stop_id,
+
+                    "cooldown_until":
+                        cooldown_until.isoformat()
+                },
+                related_bus_id=bus.id,
+                related_trip_id=trip.id,
+                related_wait_request_id=grouped_request.id
+            )
+
+
+    db.commit()
+
+
+    # ========================================
+    # RESPONSE
+    # ========================================
+
+    return {
+        "message":
+            "Wait request group skipped",
+
+        "trip_id":
+            trip.id,
+
+        "stop_id":
+            request.stop_id,
+
+        "stop_name":
+            stop_name,
+
+        "students_affected":
+            len(affected_students),
+
+        "status":
+            "rejected",
+
+        "cooldown_until":
+            cooldown_until
+    }
+# ============================================================
+# RECONCILE WAIT REQUEST GROUPS
+# ============================================================
+
+def reconcile_wait_requests(
+    db: Session,
+    trip: Trip
+):
+    now = datetime.utcnow()
+
+    pending_requests = (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.trip_id == trip.id,
+            WaitRequest.bus_id == trip.bus_id,
+            WaitRequest.status == "pending"
+        )
+        .order_by(
+            WaitRequest.created_at.asc()
+        )
+        .all()
+    )
+
+    if not pending_requests:
+        return
+
+    grouped = {}
+
+    for request in pending_requests:
+
+        if request.stop_id is None:
+            continue
+
+        key = (
+            request.trip_id,
+            request.stop_id
+        )
+
+        grouped.setdefault(
+            key,
+            []
+        ).append(request)
+
+    changed = False
+
+    for key, group in grouped.items():
+
+        deadline = max(
+            (
+                request.auto_accept_at
+                for request in group
+                if request.auto_accept_at
+            ),
+            default=None
+        )
+
+        # Still inside 10-second driver override window
+        if (
+            deadline is not None
+            and deadline > now
+        ):
+            continue
+
+        stop_id = key[1]
+
+        stop = (
+            db.query(Stop)
+            .filter(
+                Stop.id == stop_id
+            )
+            .first()
+        )
+
+        if not stop:
+            continue
+
+        # ========================================
+        # STOP ALREADY PASSED
+        # ========================================
+
+        if has_passed_stop(
+            db,
+            trip,
+            stop
+        ):
+
+            for request in group:
+
+                request.status = "rejected"
+                request.skipped_at = now
+                request.cooldown_until = (
+                    now +
+                    timedelta(
+                        minutes=
+                            WAIT_SKIP_COOLDOWN_MINUTES
+                    )
+                )
+
+                student = (
+                    db.query(Student)
+                    .filter(
+                        Student.id ==
+                            request.student_id
+                    )
+                    .first()
+                )
+
+                if student:
+
+                    send_notification(
+                        db,
+                        student.user_id,
+                        "Wait Request Cancelled",
+                        "The bus has already passed your stop.",
+                        "wait_rejected",
+                        {
+                            "wait_request_id":
+                                request.id,
+                            "trip_id":
+                                trip.id,
+                            "stop_id":
+                                stop.id
+                        },
+                        related_bus_id=
+                            trip.bus_id,
+                        related_trip_id=
+                            trip.id,
+                        related_wait_request_id=
+                            request.id
+                    )
+
+                changed = True
+
+            continue
+
+        # ========================================
+        # GROUP MAX
+        # ========================================
+
+        requested_minutes = max(
+            request.minutes
+            for request in group
+        )
+
+        remaining_budget = (
+            trip.wait_budget_total -
+            trip.wait_budget_used
+        )
+
+        # ========================================
+        # BUDGET CHECK
+        # ========================================
+
+        if (
+            remaining_budget <= 0
+            or requested_minutes > remaining_budget
+        ):
+
+            for request in group:
+
+                request.status = "rejected"
+
+                student = (
+                    db.query(Student)
+                    .filter(
+                        Student.id ==
+                            request.student_id
+                    )
+                    .first()
+                )
+
+                if student:
+
+                    send_notification(
+                        db,
+                        student.user_id,
+                        "Wait unavailable",
+                        "The bus can't wait further today.",
+                        "wait_budget_exhausted",
+                        {
+                            "wait_request_id":
+                                request.id,
+                            "trip_id":
+                                trip.id,
+                            "stop_id":
+                                stop.id,
+                            "remaining_budget":
+                                max(
+                                    0,
+                                    remaining_budget
+                                )
+                        },
+                        related_bus_id=
+                            trip.bus_id,
+                        related_trip_id=
+                            trip.id,
+                        related_wait_request_id=
+                            request.id
+                    )
+
+                changed = True
+
+            continue
+
+        # ========================================
+        # AUTO ACCEPT
+        # ========================================
+        trip.wait_budget_used += requested_minutes
+
+        wait_until = (
+            now +
+            timedelta(
+                minutes=requested_minutes
+            )
+        )
+
+        for request in group:
+
+            request.status = "accepted"
+
+            request.wait_until = wait_until
+
+            student = (
+                db.query(Student)
+                .filter(
+                    Student.id == request.student_id
+                )
+                .first()
+            )
+
+            if student:
+
+                send_notification(
+                    db,
+                    student.user_id,
+                    "Wait Request Accepted",
+                    (
+                        f"The bus will wait approximately "
+                        f"{requested_minutes} minute"
+                        f"{'s' if requested_minutes != 1 else ''} "
+                        f"at {stop.name}."
+                    ),
+                    "wait_accepted",
+                    {
+                        "wait_request_id": request.id,
+                        "trip_id": trip.id,
+                        "stop_id": request.stop_id,
+                        "minutes": requested_minutes,
+                        "wait_until": wait_until.isoformat()
+                    },
+                    related_bus_id=trip.bus_id,
+                    related_trip_id=trip.id,
+                    related_wait_request_id=request.id
+                )
+
+            changed = True
+
+    if changed:
+        db.commit()
+# ============================================================
+# ACTIVE WAIT GROUP FOR A TRIP
+# ============================================================
+
+def get_active_wait_for_stop(
+    db: Session,
+    trip_id: int,
+    stop_id: int
+):
+    now = datetime.utcnow()
+
+    return (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.trip_id == trip_id,
+            WaitRequest.stop_id == stop_id,
+            WaitRequest.status == "accepted",
+            WaitRequest.wait_until.isnot(None),
+            WaitRequest.wait_until > now
+        )
+        .order_by(
+            WaitRequest.wait_until.desc()
+        )
+        .first()
+    )
+
+
+def get_active_wait_stop(
+    db: Session,
+    trip_id: int
+):
+    now = datetime.utcnow()
+
+    return (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.trip_id == trip_id,
+            WaitRequest.status == "accepted",
+            WaitRequest.wait_until.isnot(None),
+            WaitRequest.wait_until > now
+        )
+        .order_by(
+            WaitRequest.wait_until.desc()
+        )
+        .first()
+    )
