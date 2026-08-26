@@ -16,7 +16,8 @@ from models import (
     TravelStatus,
     Trip,
     Notification,
-    DeviceToken
+    DeviceToken,
+    BusEntryLog
 )
 from schemas import (
     LoginRequest,
@@ -831,7 +832,19 @@ def update_bus_location(
     db: Session = Depends(get_db),
     current_driver: dict = Depends(require_driver)
 ):
-    # Find driver using JWT
+    # ========================================
+    # GEO-FENCE CONFIGURATION
+    # ========================================
+
+    COLLEGE_LAT = 18.0542435
+    COLLEGE_LNG = 79.5351399
+
+    GEOFENCE_RADIUS_METRES = 150
+
+    # ========================================
+    # FIND DRIVER USING JWT
+    # ========================================
+
     driver = (
         db.query(Driver)
         .filter(
@@ -846,7 +859,10 @@ def update_bus_location(
             detail="Driver profile not found"
         )
 
-    # Find driver's assigned bus
+    # ========================================
+    # FIND DRIVER'S ASSIGNED BUS
+    # ========================================
+
     bus = (
         db.query(Bus)
         .filter(
@@ -861,23 +877,43 @@ def update_bus_location(
             detail="Bus not found"
         )
 
-    # Security check
+    # ========================================
+    # SECURITY CHECK
+    # ========================================
+
     if bus.driver_id != driver.id:
         raise HTTPException(
             status_code=403,
             detail="You are not assigned to this bus"
         )
 
+    # ========================================
+    # FIND ACTIVE TRIP
+    # ========================================
+
     active_trip = (
         db.query(Trip)
-        .filter(Trip.driver_id == driver.id, Trip.bus_id == bus.id, Trip.status == "active")
-        .order_by(Trip.started_at.desc())
+        .filter(
+            Trip.driver_id == driver.id,
+            Trip.bus_id == bus.id,
+            Trip.status == "active"
+        )
+        .order_by(
+            Trip.started_at.desc()
+        )
         .first()
     )
-    if not active_trip:
-        raise HTTPException(status_code=409, detail="Start a trip before publishing location")
 
-    # Save GPS location
+    if not active_trip:
+        raise HTTPException(
+            status_code=409,
+            detail="Start a trip before publishing location"
+        )
+
+    # ========================================
+    # SAVE GPS LOCATION
+    # ========================================
+
     location = BusLocation(
         bus_id=bus.id,
         trip_id=active_trip.id,
@@ -890,30 +926,224 @@ def update_bus_location(
     db.commit()
     db.refresh(location)
 
-    # Notify once when a bus enters a student's stop approach zone during a trip.
-    for student in db.query(Student).filter(Student.bus_id == bus.id, Student.stop_id.isnot(None)).all():
-        stop = db.query(Stop).filter(Stop.id == student.stop_id).first()
+    # ========================================
+    # GEO-FENCE DISTANCE CALCULATION
+    # ========================================
+
+    lat_delta = radians(
+        COLLEGE_LAT - location.latitude
+    )
+
+    lng_delta = radians(
+        COLLEGE_LNG - location.longitude
+    )
+
+    a = (
+        sin(lat_delta / 2) ** 2
+        +
+        cos(radians(location.latitude))
+        *
+        cos(radians(COLLEGE_LAT))
+        *
+        sin(lng_delta / 2) ** 2
+    )
+
+    distance_from_college = (
+        6371000
+        *
+        2
+        *
+        asin(
+            sqrt(a)
+        )
+    )
+
+    # ========================================
+    # GEO-FENCE ENTRY DETECTION
+    # ========================================
+
+    if (
+        distance_from_college
+        <= GEOFENCE_RADIUS_METRES
+    ):
+
+        # Check whether this trip already
+        # has an entry log.
+
+        existing_entry = (
+            db.query(BusEntryLog)
+            .filter(
+                BusEntryLog.bus_id == bus.id,
+                BusEntryLog.trip_id == active_trip.id
+            )
+            .first()
+        )
+
+        # Create entry log only once
+        # for this trip.
+
+        if not existing_entry:
+
+            entry_log = BusEntryLog(
+                bus_id=bus.id,
+                trip_id=active_trip.id,
+                entry_time=location.timestamp,
+                latitude=location.latitude,
+                longitude=location.longitude
+            )
+
+            db.add(entry_log)
+
+            db.commit()
+            db.refresh(entry_log)
+
+            print(
+                f"🚌 GEO-FENCE ENTRY: "
+                f"Bus {bus.bus_number} entered "
+                f"college zone at "
+                f"{entry_log.entry_time}"
+            )
+
+    # ========================================
+    # STUDENT STOP APPROACH NOTIFICATION
+    # ========================================
+
+    for student in (
+        db.query(Student)
+        .filter(
+            Student.bus_id == bus.id,
+            Student.stop_id.isnot(None)
+        )
+        .all()
+    ):
+
+        stop = (
+            db.query(Stop)
+            .filter(
+                Stop.id == student.stop_id
+            )
+            .first()
+        )
+
         if not stop:
             continue
-        lat_delta, lng_delta = radians(stop.latitude - location.latitude), radians(stop.longitude - location.longitude)
-        a = sin(lat_delta / 2) ** 2 + cos(radians(location.latitude)) * cos(radians(stop.latitude)) * sin(lng_delta / 2) ** 2
-        metres = 6371000 * 2 * asin(sqrt(a))
-        already_notified = db.query(Notification).filter(Notification.user_id == student.user_id, Notification.type == "bus_approaching", Notification.related_trip_id == active_trip.id, Notification.message.like(f"%{stop.name}%")).first()
-        if metres <= 150 and not already_notified:
-            send_notification(db, student.user_id, "Bus Approaching", f"{bus.bus_number} is approaching your stop, {stop.name}.", "bus_approaching", {"stop_id": stop.id, "trip_id": active_trip.id}, related_bus_id=bus.id, related_trip_id=active_trip.id)
+
+        lat_delta = radians(
+            stop.latitude -
+            location.latitude
+        )
+
+        lng_delta = radians(
+            stop.longitude -
+            location.longitude
+        )
+
+        a = (
+            sin(lat_delta / 2) ** 2
+            +
+            cos(radians(location.latitude))
+            *
+            cos(radians(stop.latitude))
+            *
+            sin(lng_delta / 2) ** 2
+        )
+
+        metres = (
+            6371000
+            *
+            2
+            *
+            asin(
+                sqrt(a)
+            )
+        )
+
+        already_notified = (
+            db.query(Notification)
+            .filter(
+                Notification.user_id ==
+                    student.user_id,
+
+                Notification.type ==
+                    "bus_approaching",
+
+                Notification.related_trip_id ==
+                    active_trip.id,
+
+                Notification.message.like(
+                    f"%{stop.name}%"
+                )
+            )
+            .first()
+        )
+
+        if (
+            metres <= 150
+            and not already_notified
+        ):
+
+            send_notification(
+                db,
+                student.user_id,
+                "Bus Approaching",
+                (
+                    f"{bus.bus_number} is "
+                    f"approaching your stop, "
+                    f"{stop.name}."
+                ),
+                "bus_approaching",
+                {
+                    "stop_id": stop.id,
+                    "trip_id": active_trip.id
+                },
+                related_bus_id=bus.id,
+                related_trip_id=active_trip.id
+            )
+
     db.commit()
+
+    # ========================================
+    # RESPONSE
+    # ========================================
 
     return {
         "message": "Bus location updated",
-        "bus_id": bus.id,
-        "bus_number": bus.bus_number,
-        "driver_code": driver.driver_code,
-        "latitude": location.latitude,
-        "longitude": location.longitude,
-        "speed": location.speed,
-        "location_id": location.id
-    }
 
+        "bus_id": bus.id,
+
+        "bus_number":
+            bus.bus_number,
+
+        "driver_code":
+            driver.driver_code,
+
+        "latitude":
+            location.latitude,
+
+        "longitude":
+            location.longitude,
+
+        "speed":
+            location.speed,
+
+        "location_id":
+            location.id,
+
+        "geo_fence": {
+            "inside":
+                distance_from_college
+                <= GEOFENCE_RADIUS_METRES,
+
+            "distance_metres":
+                round(
+                    distance_from_college,
+                    2
+                ),
+
+            "radius_metres":
+                GEOFENCE_RADIUS_METRES
+        }
+    }
 @app.get("/buses/{bus_id}/location")
 def get_bus_location(
     bus_id: int,
