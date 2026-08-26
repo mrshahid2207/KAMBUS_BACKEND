@@ -72,19 +72,6 @@ class Stop(Base):
     longitude = Column(Float, nullable=False)
     stop_order = Column(Integer, nullable=False)
 
-class Trip(Base):
-    __tablename__ = "trips"
-
-    id = Column(Integer, primary_key=True, index=True)
-
-    bus_id = Column(Integer, ForeignKey("buses.id"), nullable=False)
-    driver_id = Column(Integer, ForeignKey("drivers.id"), nullable=False)
-    route_id = Column(Integer, ForeignKey("routes.id"), nullable=True)
-
-    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    ended_at = Column(DateTime, nullable=True)
-
-    status = Column(String(20), default="active", nullable=False)
     
 class BusLocation(Base):
     __tablename__ = "bus_locations"
@@ -97,18 +84,133 @@ class BusLocation(Base):
     longitude = Column(Float, nullable=False)
     speed = Column(Float, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
+class Trip(Base):
+    __tablename__ = "trips"
 
+    id = Column(Integer, primary_key=True, index=True)
+
+    bus_id = Column(
+        Integer,
+        ForeignKey("buses.id"),
+        nullable=False
+    )
+
+    driver_id = Column(
+        Integer,
+        ForeignKey("drivers.id"),
+        nullable=False
+    )
+
+    route_id = Column(
+        Integer,
+        ForeignKey("routes.id"),
+        nullable=True
+    )
+
+    started_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False
+    )
+
+    ended_at = Column(
+        DateTime,
+        nullable=True
+    )
+
+    status = Column(
+        String(20),
+        default="active",
+        nullable=False
+    )
+
+    # ========================================
+    # WAIT REQUEST BUDGET
+    # ========================================
+
+    wait_budget_total = Column(
+        Integer,
+        default=10,
+        nullable=False
+    )
+
+    wait_budget_used = Column(
+        Integer,
+        default=0,
+        nullable=False
+    )
 class WaitRequest(Base):
     __tablename__ = "wait_requests"
 
-    id = Column(Integer, primary_key=True, index=True)
-    student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
-    bus_id = Column(Integer, ForeignKey("buses.id"), nullable=False)
-    minutes = Column(Integer, nullable=False)
-    status = Column(String(20), default="pending")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True
+    )
 
+    student_id = Column(
+        Integer,
+        ForeignKey("students.id"),
+        nullable=False
+    )
 
+    bus_id = Column(
+        Integer,
+        ForeignKey("buses.id"),
+        nullable=False
+    )
+
+    trip_id = Column(
+        Integer,
+        ForeignKey("trips.id"),
+        nullable=True,
+        index=True
+    )
+
+    stop_id = Column(
+        Integer,
+        ForeignKey("stops.id"),
+        nullable=True,
+        index=True
+    )
+
+    minutes = Column(
+        Integer,
+        nullable=False
+    )
+
+    status = Column(
+        String(20),
+        default="pending",
+        nullable=False,
+        index=True
+    )
+
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False
+    )
+
+    auto_accept_at = Column(
+        DateTime,
+        nullable=True
+    )
+
+    wait_until = Column(
+        DateTime,
+        nullable=True
+    )
+
+    skipped_at = Column(
+        DateTime,
+        nullable=True
+    )
+
+    cooldown_until = Column(
+        DateTime,
+        nullable=True
+    )
 class TravelStatus(Base):
     __tablename__ = "travel_status"
 
