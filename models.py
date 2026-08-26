@@ -251,3 +251,35 @@ driver_code = Column(
     nullable=False,
     index=True
 )
+class BusEntryLog(Base):
+    __tablename__ = "bus_entry_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    bus_id = Column(
+        Integer,
+        ForeignKey("buses.id"),
+        nullable=False
+    )
+
+    trip_id = Column(
+        Integer,
+        ForeignKey("trips.id"),
+        nullable=False
+    )
+
+    entry_time = Column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False
+    )
+
+    latitude = Column(
+        Float,
+        nullable=False
+    )
+
+    longitude = Column(
+        Float,
+        nullable=False
+    )
