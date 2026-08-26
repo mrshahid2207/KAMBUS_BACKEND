@@ -2,6 +2,26 @@ from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import inspect, text
 from datetime import datetime, timedelta, date
+
+
+def to_utc_iso(dt):
+    """
+    All datetimes in this app are stored naive but represent UTC
+    (they come from datetime.utcnow()). When returned as-is in a
+    JSON response, FastAPI serializes them without a timezone
+    suffix (e.g. "2026-08-26T07:32:00"). Browsers then parse that
+    string as LOCAL time instead of UTC, which silently shifts
+    every timestamp by the user's UTC offset (+5:30 in India).
+    That skew makes freshly-received bus locations look stale on
+    the frontend, which is why ETA/location can show as
+    "unavailable" even though the data just arrived.
+
+    Always pass datetime fields through this helper before putting
+    them in a response so the frontend can parse them correctly.
+    """
+    if dt is None:
+        return None
+    return dt.isoformat() + "Z"
 from math import asin, cos, radians, sin, sqrt,atan2
 from database import Base, engine, SessionLocal
 from models import (
@@ -635,12 +655,47 @@ def register_device_token(data: DeviceTokenCreate, db: Session = Depends(get_db)
 
 
 @app.get("/notifications")
-def list_notifications(limit: int = 30, offset: int = 0, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
-    limit = max(1, min(limit, 100)); offset = max(0, offset)
-    query = db.query(Notification).filter(Notification.user_id == current_user["user_id"])
-    notifications = query.order_by(Notification.created_at.desc()).offset(offset).limit(limit).all()
-    return {"notifications": [{"id": n.id, "title": n.title, "message": n.message, "type": n.type, "is_read": bool(n.is_read), "created_at": n.created_at} for n in notifications], "unread_count": query.filter(Notification.is_read == 0).count()}
+def list_notifications(
+    limit: int = 30,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
 
+    query = (
+        db.query(Notification)
+        .filter(
+            Notification.user_id == current_user["user_id"]
+        )
+    )
+
+    notifications = (
+        query
+        .order_by(Notification.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "notifications": [
+            {
+                "id": n.id,
+                "title": n.title,
+                "message": n.message,
+                "type": n.type,
+                "payload": n.payload,
+                "is_read": bool(n.is_read),
+                "created_at": to_utc_iso(n.created_at)
+            }
+            for n in notifications
+        ],
+        "unread_count": query.filter(
+            Notification.is_read == 0
+        ).count()
+    }
 
 @app.patch("/notifications/{notification_id}/read")
 def mark_notification_read(notification_id: int, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
@@ -864,7 +919,10 @@ def create_driver_complaint(
     db: Session = Depends(get_db),
     current_student: dict = Depends(require_student)
 ):
-    # Find logged-in student
+    # ========================================
+    # FIND LOGGED-IN STUDENT
+    # ========================================
+
     student = (
         db.query(Student)
         .filter(
@@ -879,14 +937,20 @@ def create_driver_complaint(
             detail="Student profile not found"
         )
 
-    # Validate complaint reason
+    # ========================================
+    # VALIDATE COMPLAINT REASON
+    # ========================================
+
     if data.reason not in ALLOWED_COMPLAINT_REASONS:
         raise HTTPException(
             status_code=400,
             detail="Invalid complaint reason"
         )
 
-    # Other requires description
+    # ========================================
+    # OTHER REQUIRES DESCRIPTION
+    # ========================================
+
     if (
         data.reason == "other"
         and not data.description
@@ -896,14 +960,20 @@ def create_driver_complaint(
             detail="Please provide a description for this complaint"
         )
 
-    # Student must have a bus
+    # ========================================
+    # STUDENT MUST HAVE A BUS
+    # ========================================
+
     if not student.bus_id:
         raise HTTPException(
             status_code=400,
             detail="You are not assigned to a bus"
         )
 
-    # Find student's bus
+    # ========================================
+    # FIND STUDENT'S BUS
+    # ========================================
+
     bus = (
         db.query(Bus)
         .filter(
@@ -918,14 +988,20 @@ def create_driver_complaint(
             detail="Assigned bus not found"
         )
 
-    # Bus must have a driver
+    # ========================================
+    # BUS MUST HAVE A DRIVER
+    # ========================================
+
     if not bus.driver_id:
         raise HTTPException(
             status_code=400,
             detail="No driver is currently assigned to your bus"
         )
 
-    # Find active trip, if any
+    # ========================================
+    # FIND ACTIVE TRIP
+    # ========================================
+
     active_trip = (
         db.query(Trip)
         .filter(
@@ -939,7 +1015,10 @@ def create_driver_complaint(
         .first()
     )
 
-    # Create complaint
+    # ========================================
+    # CREATE COMPLAINT
+    # ========================================
+
     complaint = DriverComplaint(
         student_id=student.id,
         driver_id=bus.driver_id,
@@ -957,44 +1036,56 @@ def create_driver_complaint(
     db.add(complaint)
     db.commit()
     db.refresh(complaint)
+
     # ========================================
-    # CREATE POLL FOR OTHER STUDENTS ON BUS
+    # CREATE VERIFICATION POLL
+    # FOR OTHER STUDENTS ON SAME BUS
     # ========================================
+
     other_students = (
         db.query(Student)
         .filter(
-        Student.bus_id == bus.id,
-        Student.id != student.id
-     )
-     .all()
+            Student.bus_id == bus.id,
+            Student.id != student.id
+        )
+        .all()
     )
 
     for other_student in other_students:
 
         payload = {
-           "complaint_id": complaint.id,
-           "bus_id": bus.id,
-           "driver_id": bus.driver_id,
-           "reason": complaint.reason,
-           "poll": True
-    }
+            "complaint_id": complaint.id,
+            "bus_id": bus.id,
+            "driver_id": bus.driver_id,
+            "reason": complaint.reason,
+            "poll": True
+        }
 
-    send_notification(
-        db,
-        other_student.user_id,
-        "Driver Complaint Verification",
-        (
-            "A student has reported a problem with "
-            f"your bus driver: {complaint.reason}. "
-            "Have you faced the same problem?"
-        ),
-        "driver_complaint_poll",
-        payload,
-        related_bus_id=bus.id,
-        related_trip_id=complaint.trip_id
-    )
+        send_notification(
+            db,
+            other_student.user_id,
+            "Driver Complaint Verification",
+            (
+                "A student has reported a problem with "
+                f"your bus driver: {complaint.reason}. "
+                "Have you faced the same problem?"
+            ),
+            "driver_complaint_poll",
+            payload,
+            related_bus_id=bus.id,
+            related_trip_id=complaint.trip_id
+        )
+
+    # ========================================
+    # SAVE NOTIFICATIONS
+    # ========================================
 
     db.commit()
+
+    # ========================================
+    # RESPONSE
+    # ========================================
+
     return {
         "message": "Driver complaint submitted successfully",
         "complaint_id": complaint.id,
@@ -1547,7 +1638,7 @@ def get_bus_location(
             location.speed,
 
         "timestamp":
-            location.timestamp,
+            to_utc_iso(location.timestamp),
 
         "trip_id":
             location.trip_id,
@@ -2506,19 +2597,19 @@ def get_wait_request_status(
             wait_request.status,
 
         "created_at":
-            wait_request.created_at,
+            to_utc_iso(wait_request.created_at),
 
         "auto_accept_at":
-            wait_request.auto_accept_at,
+            to_utc_iso(wait_request.auto_accept_at),
 
         "wait_until":
-            wait_request.wait_until,
+            to_utc_iso(wait_request.wait_until),
 
         "skipped_at":
-            wait_request.skipped_at,
+            to_utc_iso(wait_request.skipped_at),
 
         "cooldown_until":
-            wait_request.cooldown_until
+            to_utc_iso(wait_request.cooldown_until)
     }
 
 @app.get("/driver/wait-requests")
@@ -2813,7 +2904,7 @@ def get_driver_wait_requests(
                             requested_minutes,
 
                         "wait_until":
-                            wait_until.isoformat()
+                            to_utc_iso(wait_until)
                     },
                     related_bus_id=bus.id,
                     related_trip_id=trip.id,
@@ -3618,7 +3709,7 @@ def get_driver_trip_status(
         "active": trip is not None,
         "trip_id": trip.id if trip else None,
         "bus_id": trip.bus_id if trip else None,
-        "started_at": trip.started_at if trip else None,
+        "started_at": to_utc_iso(trip.started_at) if trip else None,
     }
 
 
@@ -3691,7 +3782,7 @@ def start_driver_trip(
         "bus_id": bus.id,
         "route_id": bus.route_id,
         "status": trip.status,
-        "started_at": trip.started_at,
+        "started_at": to_utc_iso(trip.started_at),
     }
 @app.get("/student/my-bus")
 def get_student_my_bus(
@@ -3810,7 +3901,7 @@ def get_student_my_bus(
                 "latitude": location.latitude,
                 "longitude": location.longitude,
                 "speed": location.speed,
-                "timestamp": location.timestamp
+                "timestamp": to_utc_iso(location.timestamp)
             }
             if location else None
         )
@@ -3897,8 +3988,8 @@ def end_driver_trip(
         "message": "Trip ended successfully",
         "trip_id": trip.id,
         "status": trip.status,
-        "started_at": trip.started_at,
-        "ended_at": trip.ended_at,
+        "started_at": to_utc_iso(trip.started_at),
+        "ended_at": to_utc_iso(trip.ended_at),
     }
 @app.post("/driver/wait-request/{request_id}/skip")
 def skip_wait_request(
@@ -4104,7 +4195,7 @@ def skip_wait_request(
                         request.stop_id,
 
                     "cooldown_until":
-                        cooldown_until.isoformat()
+                        to_utc_iso(cooldown_until)
                 },
                 related_bus_id=bus.id,
                 related_trip_id=trip.id,
@@ -4389,7 +4480,7 @@ def reconcile_wait_requests(
                         "trip_id": trip.id,
                         "stop_id": request.stop_id,
                         "minutes": requested_minutes,
-                        "wait_until": wait_until.isoformat()
+                        "wait_until": to_utc_iso(wait_until)
                     },
                     related_bus_id=trip.bus_id,
                     related_trip_id=trip.id,
