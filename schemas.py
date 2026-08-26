@@ -99,3 +99,6 @@ class AdminStopCreate(BaseModel):
 class DeviceTokenCreate(BaseModel):
     token: str
     platform: str = "android"
+class DriverComplaintCreate(BaseModel):
+    reason: str
+    description: str | None = None

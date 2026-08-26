@@ -283,3 +283,88 @@ class BusEntryLog(Base):
         Float,
         nullable=False
     )
+class DriverComplaint(Base):
+    __tablename__ = "driver_complaints"
+
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True
+    )
+
+    student_id = Column(
+        Integer,
+        ForeignKey("students.id"),
+        nullable=False
+    )
+
+    driver_id = Column(
+        Integer,
+        ForeignKey("drivers.id"),
+        nullable=False
+    )
+
+    bus_id = Column(
+        Integer,
+        ForeignKey("buses.id"),
+        nullable=False
+    )
+
+    trip_id = Column(
+        Integer,
+        ForeignKey("trips.id"),
+        nullable=True
+    )
+
+    reason = Column(
+        String(100),
+        nullable=False
+    )
+
+    description = Column(
+        Text,
+        nullable=True
+    )
+
+    status = Column(
+        String(20),
+        default="pending",
+        nullable=False
+    )
+
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False
+    )
+class ComplaintVerification(Base):
+    __tablename__ = "complaint_verifications"
+
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True
+    )
+
+    complaint_id = Column(
+        Integer,
+        ForeignKey("driver_complaints.id"),
+        nullable=False
+    )
+
+    student_id = Column(
+        Integer,
+        ForeignKey("students.id"),
+        nullable=False
+    )
+
+    response = Column(
+        String(10),
+        nullable=False
+    )
+
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False
+    )

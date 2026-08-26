@@ -17,7 +17,9 @@ from models import (
     Trip,
     Notification,
     DeviceToken,
-    BusEntryLog
+    BusEntryLog,
+    DriverComplaint,
+    ComplaintVerification
 )
 from schemas import (
     LoginRequest,
@@ -39,7 +41,8 @@ from schemas import (
     AdminRouteCreate,
     AdminRouteUpdate,
     AdminStopCreate
-    ,DeviceTokenCreate
+    ,DeviceTokenCreate,
+    DriverComplaintCreate
 )
 from notification_service import send_notification
 import models
@@ -52,6 +55,13 @@ from auth import (
     require_admin,
     require_student
 )
+ALLOWED_COMPLAINT_REASONS = [
+    "driver_not_on_time",
+    "foul_language",
+    "over_speeding_rash_driving",
+    "improper_behaviour",
+    "other"
+]
 app = FastAPI(title="KAMBUS API")
 
 Base.metadata.create_all(bind=engine)
@@ -87,6 +97,8 @@ def initialize_trip_database():
             connection.execute(text("ALTER TABLE students ADD COLUMN stop_id INTEGER REFERENCES stops(id)"))
     Notification.__table__.create(bind=engine, checkfirst=True)
     DeviceToken.__table__.create(bind=engine, checkfirst=True)
+    DriverComplaint.__table__.create(bind=engine,checkfirst=True)
+    ComplaintVerification.__table__.create(bind=engine,checkfirst=True)
 # ============================================================
 # KAMBUS WAIT REQUEST CONFIGURATION
 # ============================================================
@@ -757,7 +769,115 @@ def create_stop(
         "name": stop.name
     }
 
+@app.post("/student/driver-complaint")
+def create_driver_complaint(
+    data: DriverComplaintCreate,
+    db: Session = Depends(get_db),
+    current_student: dict = Depends(require_student)
+):
+    # Find logged-in student
+    student = (
+        db.query(Student)
+        .filter(
+            Student.user_id == current_student["user_id"]
+        )
+        .first()
+    )
 
+    if not student:
+        raise HTTPException(
+            status_code=404,
+            detail="Student profile not found"
+        )
+
+    # Validate complaint reason
+    if data.reason not in ALLOWED_COMPLAINT_REASONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid complaint reason"
+        )
+
+    # Other requires description
+    if (
+        data.reason == "other"
+        and not data.description
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Please provide a description for this complaint"
+        )
+
+    # Student must have a bus
+    if not student.bus_id:
+        raise HTTPException(
+            status_code=400,
+            detail="You are not assigned to a bus"
+        )
+
+    # Find student's bus
+    bus = (
+        db.query(Bus)
+        .filter(
+            Bus.id == student.bus_id
+        )
+        .first()
+    )
+
+    if not bus:
+        raise HTTPException(
+            status_code=404,
+            detail="Assigned bus not found"
+        )
+
+    # Bus must have a driver
+    if not bus.driver_id:
+        raise HTTPException(
+            status_code=400,
+            detail="No driver is currently assigned to your bus"
+        )
+
+    # Find active trip, if any
+    active_trip = (
+        db.query(Trip)
+        .filter(
+            Trip.bus_id == bus.id,
+            Trip.driver_id == bus.driver_id,
+            Trip.status == "active"
+        )
+        .order_by(
+            Trip.started_at.desc()
+        )
+        .first()
+    )
+
+    # Create complaint
+    complaint = DriverComplaint(
+        student_id=student.id,
+        driver_id=bus.driver_id,
+        bus_id=bus.id,
+        trip_id=(
+            active_trip.id
+            if active_trip
+            else None
+        ),
+        reason=data.reason,
+        description=data.description,
+        status="pending"
+    )
+
+    db.add(complaint)
+    db.commit()
+    db.refresh(complaint)
+
+    return {
+        "message": "Driver complaint submitted successfully",
+        "complaint_id": complaint.id,
+        "bus_id": complaint.bus_id,
+        "driver_id": complaint.driver_id,
+        "trip_id": complaint.trip_id,
+        "reason": complaint.reason,
+        "status": complaint.status
+    }
 @app.post("/students")
 def create_student(
     data: StudentCreate,
