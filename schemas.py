@@ -102,3 +102,6 @@ class DeviceTokenCreate(BaseModel):
 class DriverComplaintCreate(BaseModel):
     reason: str
     description: str | None = None
+class ComplaintVerificationCreate(BaseModel):
+    complaint_id: int
+    response: str

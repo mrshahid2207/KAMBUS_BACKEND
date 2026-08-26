@@ -42,10 +42,11 @@ from schemas import (
     AdminRouteUpdate,
     AdminStopCreate
     ,DeviceTokenCreate,
-    DriverComplaintCreate
+    DriverComplaintCreate,
+    ComplaintVerificationCreate
 )
 from notification_service import send_notification
-import models
+import models,json
 from auth import (
     hash_password,
     verify_password,
@@ -529,7 +530,95 @@ def get_db():
     finally:
         db.close()
 
+@app.post("/student/driver-complaint/verify")
+def verify_driver_complaint(
+    data: ComplaintVerificationCreate,
+    db: Session = Depends(get_db),
+    current_student: dict = Depends(require_student)
+):
+    # Find logged-in student
+    student = (
+        db.query(Student)
+        .filter(
+            Student.user_id == current_student["user_id"]
+        )
+        .first()
+    )
 
+    if not student:
+        raise HTTPException(
+            status_code=404,
+            detail="Student profile not found"
+        )
+
+    # Validate response
+    if data.response not in ["yes", "no"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Response must be yes or no"
+        )
+
+    # Find complaint
+    complaint = (
+        db.query(DriverComplaint)
+        .filter(
+            DriverComplaint.id == data.complaint_id
+        )
+        .first()
+    )
+
+    if not complaint:
+        raise HTTPException(
+            status_code=404,
+            detail="Complaint not found"
+        )
+
+    # Complaint creator cannot verify their own complaint
+    if complaint.student_id == student.id:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot verify your own complaint"
+        )
+
+    # Student must belong to the same bus
+    if student.bus_id != complaint.bus_id:
+        raise HTTPException(
+            status_code=403,
+            detail="This complaint is not related to your bus"
+        )
+
+    # Prevent duplicate verification
+    existing_verification = (
+        db.query(ComplaintVerification)
+        .filter(
+            ComplaintVerification.complaint_id == complaint.id,
+            ComplaintVerification.student_id == student.id
+        )
+        .first()
+    )
+
+    if existing_verification:
+        raise HTTPException(
+            status_code=400,
+            detail="You have already responded to this complaint"
+        )
+
+    # Save verification
+    verification = ComplaintVerification(
+        complaint_id=complaint.id,
+        student_id=student.id,
+        response=data.response
+    )
+
+    db.add(verification)
+    db.commit()
+    db.refresh(verification)
+
+    return {
+        "message": "Complaint verification submitted successfully",
+        "complaint_id": complaint.id,
+        "response": verification.response
+    }
 @app.post("/notifications/device-token")
 def register_device_token(data: DeviceTokenCreate, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
     token = data.token.strip()
@@ -868,7 +957,44 @@ def create_driver_complaint(
     db.add(complaint)
     db.commit()
     db.refresh(complaint)
+    # ========================================
+    # CREATE POLL FOR OTHER STUDENTS ON BUS
+    # ========================================
+    other_students = (
+        db.query(Student)
+        .filter(
+        Student.bus_id == bus.id,
+        Student.id != student.id
+     )
+     .all()
+    )
 
+    for other_student in other_students:
+
+        payload = {
+           "complaint_id": complaint.id,
+           "bus_id": bus.id,
+           "driver_id": bus.driver_id,
+           "reason": complaint.reason,
+           "poll": True
+    }
+
+    send_notification(
+        db,
+        other_student.user_id,
+        "Driver Complaint Verification",
+        (
+            "A student has reported a problem with "
+            f"your bus driver: {complaint.reason}. "
+            "Have you faced the same problem?"
+        ),
+        "driver_complaint_poll",
+        payload,
+        related_bus_id=bus.id,
+        related_trip_id=complaint.trip_id
+    )
+
+    db.commit()
     return {
         "message": "Driver complaint submitted successfully",
         "complaint_id": complaint.id,
