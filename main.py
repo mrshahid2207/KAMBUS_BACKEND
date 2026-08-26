@@ -651,6 +651,9 @@ def create_stop(route_id: int, data: StopCreate, db: Session = Depends(get_db)):
 # ============================================================
 # DRIVER COMPLAINT CREATION (WITH IMMEDIATE REALTIME PUSH)
 # ============================================================
+# ============================================================
+# DRIVER COMPLAINT CREATION (WITH DESCRIPTION IN PAYLOAD)
+# ============================================================
 
 @app.post("/student/driver-complaint")
 def create_driver_complaint(
@@ -670,7 +673,7 @@ def create_driver_complaint(
     if data.reason not in ALLOWED_COMPLAINT_REASONS:
         raise HTTPException(status_code=400, detail="Invalid complaint reason")
 
-    if data.reason == "other" and not data.description:
+    if data.reason == "other" and (not data.description or not data.description.strip()):
         raise HTTPException(status_code=400, detail="Please provide a description for this complaint")
 
     if not student.bus_id:
@@ -700,7 +703,7 @@ def create_driver_complaint(
         bus_id=bus.id,
         trip_id=active_trip.id if active_trip else None,
         reason=data.reason,
-        description=data.description,
+        description=data.description.strip() if data.description else None,
         status="pending"
     )
 
@@ -708,7 +711,7 @@ def create_driver_complaint(
     db.commit()
     db.refresh(complaint)
 
-    # 1. Query OTHER students on the same bus (exclude complainant)
+    # Query OTHER students on the same bus (exclude complainant)
     other_students = (
         db.query(Student)
         .filter(
@@ -718,18 +721,26 @@ def create_driver_complaint(
         .all()
     )
 
+    # Use custom description in the message if "other"
+    reported_issue = (
+        complaint.description
+        if complaint.reason == "other" and complaint.description
+        else complaint.reason
+    )
+
     neutral_message = (
-        f"A student has reported a problem with your bus driver: {complaint.reason}. "
+        f"A student has reported a problem with your bus driver: {reported_issue}. "
         "Have you faced the same problem?"
     )
 
-    # 2. Distribute DB notification & trigger instantaneous realtime push
+    # Distribute DB notifications and trigger instant realtime push with description
     for other_student in other_students:
         payload = {
             "complaint_id": complaint.id,
             "bus_id": bus.id,
             "driver_id": bus.driver_id,
             "reason": complaint.reason,
+            "description": complaint.description,  # Preserved in payload
             "poll": True
         }
 
@@ -779,10 +790,9 @@ def create_driver_complaint(
         "driver_id": complaint.driver_id,
         "trip_id": complaint.trip_id,
         "reason": complaint.reason,
+        "description": complaint.description,
         "status": complaint.status
     }
-
-
 # ============================================================
 # STUDENT PROFILE & MAP ENDPOINTS
 # ============================================================
