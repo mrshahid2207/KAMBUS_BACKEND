@@ -853,8 +853,8 @@ def update_bus_location(
     current_driver: dict = Depends(require_driver)
 ):
     COLLEGE_LAT = 18.054145359568437
-COLLEGE_LNG = 79.53558731724873
-GEOFENCE_RADIUS_METRES = 150
+    COLLEGE_LNG = 79.53558731724873
+    GEOFENCE_RADIUS_METRES = 300
 
     driver = db.query(Driver).filter(Driver.user_id == current_driver["user_id"]).first()
     if not driver:
