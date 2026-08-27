@@ -50,7 +50,6 @@ from schemas import (
     ComplaintVerificationCreate
 )
 from notification_service import send_notification
-import models
 from auth import (
     hash_password,
     verify_password,
@@ -67,7 +66,6 @@ def to_utc_iso(dt):
     if dt is None:
         return None
     return dt.isoformat() + "Z"
-
 
 ALLOWED_COMPLAINT_REASONS = [
     "driver_not_on_time",
@@ -198,10 +196,6 @@ def initialize_trip_database():
     ComplaintVerification.__table__.create(bind=engine, checkfirst=True)
 
 
-# ============================================================
-# KAMBUS WAIT REQUEST CONFIGURATION
-# ============================================================
-
 WAIT_BUDGET_PER_TRIP = 10
 WAIT_DRIVER_SKIP_WINDOW_SECONDS = 10
 WAIT_MIN_ETA_MINUTES = 1
@@ -210,10 +204,6 @@ WAIT_RATE_LIMIT_SECONDS = 30
 WAIT_WEEKLY_LIMIT = 3
 WAIT_SKIP_COOLDOWN_MINUTES = 15
 
-
-# ============================================================
-# DISTANCE HELPER
-# ============================================================
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     earth_radius_km = 6371.0
@@ -226,10 +216,6 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return earth_radius_km * c
 
-
-# ============================================================
-# ACTIVE TRIP & LATEST LOCATION
-# ============================================================
 
 def get_active_trip_for_bus(db: Session, bus_id: int):
     return (
@@ -475,7 +461,7 @@ def verify_driver_complaint(
 
 
 # ============================================================
-# NOTIFICATIONS API (WITH PAYLOAD & REALTIME SUPPORT)
+# NOTIFICATIONS API (WITH AUTO-HYDRATION OF DESCRIPTION)
 # ============================================================
 
 @app.post("/notifications/device-token")
@@ -509,19 +495,41 @@ def list_notifications(
     query = db.query(Notification).filter(Notification.user_id == current_user["user_id"])
     notifications = query.order_by(Notification.created_at.desc()).offset(offset).limit(limit).all()
 
+    result = []
+    for n in notifications:
+        payload_data = None
+        if hasattr(n, "payload") and n.payload:
+            if isinstance(n.payload, str):
+                try:
+                    payload_data = json.loads(n.payload)
+                except Exception:
+                    payload_data = {"raw": n.payload}
+            elif isinstance(n.payload, dict):
+                payload_data = n.payload
+
+        # Auto-hydrate complaint details from DB if this is a complaint poll
+        if n.type == "driver_complaint_poll":
+            if not isinstance(payload_data, dict):
+                payload_data = {}
+            complaint_id = payload_data.get("complaint_id")
+            if complaint_id:
+                complaint = db.query(DriverComplaint).filter(DriverComplaint.id == complaint_id).first()
+                if complaint:
+                    payload_data["reason"] = complaint.reason
+                    payload_data["description"] = complaint.description
+
+        result.append({
+            "id": n.id,
+            "title": n.title,
+            "message": n.message,
+            "type": n.type,
+            "payload": payload_data,
+            "is_read": bool(n.is_read),
+            "created_at": to_utc_iso(n.created_at)
+        })
+
     return {
-        "notifications": [
-            {
-                "id": n.id,
-                "title": n.title,
-                "message": n.message,
-                "type": n.type,
-                "payload": n.payload,
-                "is_read": bool(n.is_read),
-                "created_at": to_utc_iso(n.created_at)
-            }
-            for n in notifications
-        ],
+        "notifications": result,
         "unread_count": query.filter(Notification.is_read == 0).count()
     }
 
@@ -649,10 +657,7 @@ def create_stop(route_id: int, data: StopCreate, db: Session = Depends(get_db)):
 
 
 # ============================================================
-# DRIVER COMPLAINT CREATION (WITH IMMEDIATE REALTIME PUSH)
-# ============================================================
-# ============================================================
-# DRIVER COMPLAINT CREATION (WITH DESCRIPTION IN PAYLOAD)
+# DRIVER COMPLAINT CREATION (WITH DESCRIPTION IN PAYLOAD & WS)
 # ============================================================
 
 @app.post("/student/driver-complaint")
@@ -721,9 +726,9 @@ def create_driver_complaint(
         .all()
     )
 
-    # Use custom description in the message if "other"
+    # Use custom description in the message if reason is "other"
     reported_issue = (
-        complaint.description
+        complaint.description.strip()
         if complaint.reason == "other" and complaint.description
         else complaint.reason
     )
@@ -740,11 +745,11 @@ def create_driver_complaint(
             "bus_id": bus.id,
             "driver_id": bus.driver_id,
             "reason": complaint.reason,
-            "description": complaint.description,  # Preserved in payload
+            "description": complaint.description,
             "poll": True
         }
 
-        # DB notification (persistent fallback)
+        # Save to DB (fallback)
         send_notification(
             db,
             other_student.user_id,
@@ -756,7 +761,7 @@ def create_driver_complaint(
             related_trip_id=complaint.trip_id
         )
 
-        # Instant Real-time WebSocket Push
+        # Immediate Real-time WebSocket Push
         try:
             latest_notif = (
                 db.query(Notification)
@@ -775,6 +780,9 @@ def create_driver_complaint(
                 "title": "Driver Complaint Verification",
                 "message": neutral_message,
                 "payload": payload,
+                "reason": complaint.reason,
+                "description": complaint.description,
+                "complaint_id": complaint.id,
                 "created_at": to_utc_iso(datetime.utcnow())
             }
             notification_manager.push_notification_sync(other_student.user_id, realtime_event)
@@ -793,6 +801,8 @@ def create_driver_complaint(
         "description": complaint.description,
         "status": complaint.status
     }
+
+
 # ============================================================
 # STUDENT PROFILE & MAP ENDPOINTS
 # ============================================================
@@ -852,9 +862,9 @@ def update_bus_location(
     db: Session = Depends(get_db),
     current_driver: dict = Depends(require_driver)
 ):
-    COLLEGE_LAT = 18.054145359568437
-    COLLEGE_LNG = 79.53558731724873
-    GEOFENCE_RADIUS_METRES = 300
+    COLLEGE_LAT = 18.0542435
+    COLLEGE_LNG = 79.5351399
+    GEOFENCE_RADIUS_METRES =50   
 
     driver = db.query(Driver).filter(Driver.user_id == current_driver["user_id"]).first()
     if not driver:
@@ -1710,12 +1720,15 @@ def reject_wait_request(
         "status": request.status
     }
 
-
 @app.get("/driver/route-stops")
 def get_driver_route_stops(
     db: Session = Depends(get_db),
     current_driver: dict = Depends(require_driver)
 ):
+    # Authoritative college geofence coordinates
+    COLLEGE_LAT = 18.054145359568437
+    COLLEGE_LNG = 79.53558731724873
+
     driver = db.query(Driver).filter(Driver.user_id == current_driver["user_id"]).first()
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
@@ -1729,24 +1742,54 @@ def get_driver_route_stops(
 
     stops = db.query(Stop).filter(Stop.route_id == bus.route_id).order_by(Stop.stop_order.asc()).all()
 
+    # Query all students assigned to this driver's bus
+    today = date.today()
+    students = db.query(Student).filter(Student.bus_id == bus.id).all()
+    student_ids = [s.id for s in students]
+
+    # Find students who marked 'not_travelling' for today
+    not_travelling_ids = set()
+    if student_ids:
+        not_travelling_rows = db.query(TravelStatus.student_id).filter(
+            TravelStatus.student_id.in_(student_ids),
+            TravelStatus.date == today,
+            TravelStatus.status == "not_travelling"
+        ).all()
+        not_travelling_ids = {row[0] for row in not_travelling_rows}
+
+    # Aggregate active students per stop and total for today
+    stop_student_counts = {}
+    total_expected_today = 0
+    for s in students:
+        if s.id not in not_travelling_ids:
+            total_expected_today += 1
+            if s.stop_id:
+                stop_student_counts[s.stop_id] = stop_student_counts.get(s.stop_id, 0) + 1
+
     return {
         "bus_id": bus.id,
         "bus_number": bus.bus_number,
         "route_id": bus.route_id,
         "total_stops": len(stops),
+        "total_students_today": total_expected_today,
+        "total_assigned_students": len(students),
+        "college_location": {
+            "latitude": COLLEGE_LAT,
+            "longitude": COLLEGE_LNG,
+            "name": "KITSW / College"
+        },
         "stops": [
             {
                 "stop_id": stop.id,
                 "name": stop.name,
                 "latitude": stop.latitude,
                 "longitude": stop.longitude,
-                "stop_order": stop.stop_order
+                "stop_order": stop.stop_order,
+                "student_count": stop_student_counts.get(stop.id, 0)
             }
             for stop in stops
         ]
     }
-
-
 @app.post("/student/travel-status")
 def update_travel_status(
     data: TravelStatusCreate,
