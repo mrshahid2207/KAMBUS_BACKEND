@@ -19,9 +19,11 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False)
+    email = Column(String(120), unique=True, nullable=True, index=True)
     phone = Column(String(20), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
     role = Column(String(20), nullable=False)
+    is_verified = Column(Integer, default=1, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -369,3 +371,42 @@ class ComplaintVerification(Base):
         default=datetime.utcnow,
         nullable=False
     )
+
+
+class AdminActivityLog(Base):
+    __tablename__ = "admin_activity_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    admin_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    action = Column(String(100), nullable=False)
+    entity_type = Column(String(50), nullable=True)
+    entity_id = Column(String(50), nullable=True)
+    details = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class AnnouncementHistory(Base):
+    __tablename__ = "announcement_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    template_type = Column(String(50), nullable=False)
+    title = Column(String(200), nullable=False)
+    message = Column(Text, nullable=False)
+    target_type = Column(String(50), nullable=False, default="all")
+    target_id = Column(Integer, nullable=True)
+    recipient_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class StudentOTP(Base):
+    __tablename__ = "student_otps"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(120), nullable=False, index=True)
+    otp_code = Column(String(255), nullable=False)
+    purpose = Column(String(30), default="student_signup", nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    expires_at = Column(DateTime, nullable=False)
+    is_used = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

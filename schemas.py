@@ -105,3 +105,107 @@ class DriverComplaintCreate(BaseModel):
 class ComplaintVerificationCreate(BaseModel):
     complaint_id: int
     response: str
+class VerifyPassRequest(BaseModel):
+    query: str
+    latitude: float | None = None
+    longitude: float | None = None
+class DriverDetourCreate(BaseModel):
+    reason: str
+    delay_minutes: int = 10
+    notes: str | None = None
+class DriverEmergencySosCreate(BaseModel):
+    incident_type: str
+    latitude: float | None = None
+    longitude: float | None = None
+    notes: str | None = None
+
+
+class AdminDriverCreate(BaseModel):
+    name: str
+    phone: str
+    password: str
+    driver_code: str
+    license_number: str | None = None
+
+
+class AdminDriverUpdate(BaseModel):
+    name: str | None = None
+    phone: str | None = None
+    driver_code: str | None = None
+    license_number: str | None = None
+    password: str | None = None
+
+
+class AdminStudentCreate(BaseModel):
+    name: str
+    phone: str
+    password: str
+    roll_number: str
+    department: str | None = None
+    bus_id: int | None = None
+    stop_id: int | None = None
+
+
+class AdminStudentUpdate(BaseModel):
+    name: str | None = None
+    phone: str | None = None
+    roll_number: str | None = None
+    department: str | None = None
+    bus_id: int | None = None
+    stop_id: int | None = None
+    password: str | None = None
+
+
+class AdminStopUpdate(BaseModel):
+    name: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    stop_order: int | None = None
+    route_id: int | None = None
+
+
+class AdminReorderStopsRequest(BaseModel):
+    stop_ids: list[int]
+
+
+class AdminAssignBusDriverRequest(BaseModel):
+    driver_id: int | None = None
+
+
+class AdminAssignBusRouteRequest(BaseModel):
+    route_id: int | None = None
+
+
+class AdminCalculateRecipientsRequest(BaseModel):
+    target_type: str  # "all", "bus", "route", "stop"
+    target_id: int | None = None
+
+
+class AdminBroadcastAnnouncementRequest(BaseModel):
+    template_type: str
+    title: str
+    message: str
+    target_type: str = "all"
+    target_id: int | None = None
+
+
+class StudentSignupRequest(BaseModel):
+    name: str
+    roll_number: str
+    email: str
+    phone: str
+    password: str
+    department: str | None = None
+
+
+class StudentVerifyOtpRequest(BaseModel):
+    email: str
+    otp_code: str
+
+
+class StudentResendOtpRequest(BaseModel):
+    email: str
+
+
+class StudentSelectStopRequest(BaseModel):
+    stop_id: int
