@@ -755,7 +755,16 @@ def student_signup(data: StudentSignupRequest, db: Session = Depends(get_db)):
     db.commit()
 
     # Dispatch email
-    send_student_verification_email(email, name, otp_code)
+    email_sent, email_error = send_student_verification_email(email, name, otp_code)
+    if not email_sent:
+        logger.error(f"Signup OTP email dispatch failed for user_id={user.id}: {email_error}")
+        # NOTE: user/student/otp rows are intentionally kept (not rolled back) so the
+        # student can retry via /auth/student/resend-otp once SMTP is fixed, without
+        # having to re-submit the whole signup form.
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to send verification email. Please try again later."
+        )
 
     return {
         "success": True,
@@ -868,7 +877,13 @@ def resend_student_otp(data: StudentResendOtpRequest, db: Session = Depends(get_
     db.add(new_otp)
     db.commit()
 
-    send_student_verification_email(email, user.name, otp_code)
+    email_sent, email_error = send_student_verification_email(email, user.name, otp_code)
+    if not email_sent:
+        logger.error(f"Resend OTP email dispatch failed for user_id={user.id}: {email_error}")
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to send verification email. Please try again later."
+        )
 
     return {
         "success": True,

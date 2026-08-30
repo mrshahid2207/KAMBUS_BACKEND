@@ -19,10 +19,32 @@ def send_student_verification_email(recipient_email: str, student_name: str, otp
     Returns (success: bool, error: str | None).
     """
     smtp_host = os.getenv("SMTP_HOST")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_port_raw = os.getenv("SMTP_PORT", "587")
     smtp_user = os.getenv("SMTP_USER") or os.getenv("EMAIL_USER")
     smtp_password = os.getenv("SMTP_PASSWORD") or os.getenv("EMAIL_PASSWORD") or os.getenv("SMTP_PASS")
     smtp_from = os.getenv("SMTP_FROM") or smtp_user or "noreply@kambus.app"
+
+    try:
+        smtp_port = int(smtp_port_raw)
+    except (TypeError, ValueError):
+        logger.error(f"Invalid SMTP_PORT value: {smtp_port_raw!r}")
+        return False, "SMTP_PORT is not a valid integer"
+
+    # Diagnostic logging (safe: no OTP, no password, no JWT)
+    missing = [
+        name for name, val in (
+            ("SMTP_HOST", smtp_host),
+            ("SMTP_USER", smtp_user),
+            ("SMTP_PASSWORD", smtp_password),
+        )
+        if not val
+    ]
+    if missing:
+        logger.error(
+            f"SMTP not configured — missing env var(s): {', '.join(missing)}. "
+            f"Verification email to {recipient_email} was NOT sent."
+        )
+        return False, f"SMTP is not configured on the server (missing: {', '.join(missing)})"
 
     subject = "KAMBUS — Verify your student email"
 
@@ -66,35 +88,49 @@ def send_student_verification_email(recipient_email: str, student_name: str, otp
     </html>
     """
 
-    # If SMTP is configured, attempt sending real email
-    if smtp_host and smtp_user and smtp_password:
-        try:
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = subject
-            msg["From"] = f"KAMBUS <{smtp_from}>"
-            msg["To"] = recipient_email
+    # SMTP is configured — attempt to send the real email.
+    logger.info(
+        f"Attempting SMTP send | host={smtp_host} port={smtp_port} "
+        f"from={smtp_from} to={recipient_email} mode={'SSL' if smtp_port == 465 else 'STARTTLS'}"
+    )
 
-            part = MIMEText(html_content, "html")
-            msg.attach(part)
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"KAMBUS <{smtp_from}>"
+        msg["To"] = recipient_email
 
-            if smtp_port == 465:
-                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=10) as server:
-                    server.login(smtp_user, smtp_password)
-                    server.sendmail(smtp_from, [recipient_email], msg.as_string())
-            else:
-                with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
-                    server.ehlo()
-                    server.starttls()
-                    server.login(smtp_user, smtp_password)
-                    server.sendmail(smtp_from, [recipient_email], msg.as_string())
+        part = MIMEText(html_content, "html")
+        msg.attach(part)
 
-            logger.info(f"Verification email successfully dispatched to {recipient_email}")
-            return True, None
-        except Exception as e:
-            logger.error(f"Failed to dispatch verification email via SMTP: {e}")
-            # Fall back to simulated email dispatch in dev environments
-            return False, str(e)
-    else:
-        # Development / Simulation mode
-        logger.info(f"[SIMULATED EMAIL] Verification code dispatched for {recipient_email}")
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=10) as server:
+                logger.info(f"SMTP SSL connection established to {smtp_host}:{smtp_port}")
+                server.login(smtp_user, smtp_password)
+                logger.info("SMTP authentication succeeded")
+                server.sendmail(smtp_from, [recipient_email], msg.as_string())
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                logger.info(f"SMTP STARTTLS connection established to {smtp_host}:{smtp_port}")
+                server.login(smtp_user, smtp_password)
+                logger.info("SMTP authentication succeeded")
+                server.sendmail(smtp_from, [recipient_email], msg.as_string())
+
+        logger.info(f"Verification email successfully dispatched to {recipient_email}")
         return True, None
+
+    except smtplib.SMTPAuthenticationError as e:
+        logger.error(f"SMTP authentication FAILED for user on {smtp_host}:{smtp_port}: {e}")
+        return False, "SMTP authentication failed"
+    except smtplib.SMTPConnectError as e:
+        logger.error(f"SMTP connection FAILED to {smtp_host}:{smtp_port}: {e}")
+        return False, "SMTP connection failed"
+    except (smtplib.SMTPException, TimeoutError, OSError) as e:
+        logger.error(f"SMTP send FAILED to {smtp_host}:{smtp_port}: {e}")
+        return False, "SMTP send failed"
+    except Exception as e:
+        logger.error(f"Unexpected error dispatching verification email via SMTP: {e}")
+        return False, "Unexpected error while sending email"
