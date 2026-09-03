@@ -1,6 +1,7 @@
 from datetime import datetime, date
 
 from sqlalchemy import (
+    Boolean,
     Column,
     Integer,
     String,
@@ -75,7 +76,12 @@ class Stop(Base):
     longitude = Column(Float, nullable=False)
     stop_order = Column(Integer, nullable=False)
 
-    
+    # Temporary map-selected stop support
+    is_custom = Column(Boolean, nullable=False, default=False, server_default="false")
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    created_by_student_id = Column(Integer, ForeignKey("students.id"), nullable=True)
+
+
 class BusLocation(Base):
     __tablename__ = "bus_locations"
 
@@ -410,3 +416,35 @@ class StudentOTP(Base):
     expires_at = Column(DateTime, nullable=False)
     is_used = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+class MissedBusAllotment(Base):
+    __tablename__ = "missed_bus_allotments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("students.id"), nullable=False, index=True)
+    original_bus_id = Column(Integer, ForeignKey("buses.id"), nullable=False)
+    alternative_bus_id = Column(Integer, ForeignKey("buses.id"), nullable=False)
+    original_trip_id = Column(Integer, ForeignKey("trips.id"), nullable=True)
+    alternative_trip_id = Column(Integer, ForeignKey("trips.id"), nullable=True)
+    stop_id = Column(Integer, ForeignKey("stops.id"), nullable=False)
+    status = Column(String(20), default="active", nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=True)
+
+
+class TemporaryStopChange(Base):
+    __tablename__ = "temporary_stop_changes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("students.id"), nullable=False, index=True)
+    original_stop_id = Column(Integer, ForeignKey("stops.id"), nullable=False)
+    temporary_stop_id = Column(Integer, ForeignKey("stops.id"), nullable=False)
+    start_date = Column(Date, nullable=False, index=True)
+    end_date = Column(Date, nullable=False, index=True)
+    status = Column(String(20), default="scheduled", nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Immutable audit copy of the exact location selected on the map
+    selected_latitude = Column(Float, nullable=True)
+    selected_longitude = Column(Float, nullable=True)
+    selected_address = Column(String, nullable=True)

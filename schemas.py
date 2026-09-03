@@ -1,4 +1,5 @@
-from pydantic import BaseModel
+from pydantic import BaseModel,Field
+from datetime import date
 class LoginRequest(BaseModel):
     identifier: str
     password: str
@@ -209,3 +210,16 @@ class StudentResendOtpRequest(BaseModel):
 
 class StudentSelectStopRequest(BaseModel):
     stop_id: int
+class TemporaryStopChangeCreate(BaseModel):
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+ 
+    # Reverse-geocoded label the client resolved for this point
+    # (e.g. "MG Road, Warangal"). Optional — if omitted, the backend
+    # falls back to a generic label ("Custom Stop") rather than failing
+    # the request, since geocoding is a display nicety, not a
+    # correctness requirement.
+    address: str | None = Field(None, max_length=255)
+ 
+    start_date: date
+    end_date: date
