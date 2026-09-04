@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.orm import Session
-from sqlalchemy import inspect, text
+from sqlalchemy import func, inspect, text
 from datetime import datetime, timedelta, date
 from math import asin, cos, radians, sin, sqrt, atan2
 import json
@@ -8,6 +8,7 @@ import logging
 import asyncio
 import hashlib
 import hmac
+import requests
 
 from database import Base, engine, SessionLocal
 from models import (
@@ -229,6 +230,44 @@ def initialize_trip_database():
         with engine.begin() as connection:
             try:
                 connection.execute(text("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 1"))
+            except Exception:
+                pass
+
+    # Map-based temporary-stop schema additions. These are intentionally additive
+    # so existing Kambus databases continue to work without destructive changes.
+    stops_columns = {column["name"] for column in inspect(engine).get_columns("stops")}
+    with engine.begin() as connection:
+        if "is_custom" not in stops_columns:
+            try:
+                connection.execute(text("ALTER TABLE stops ADD COLUMN is_custom BOOLEAN NOT NULL DEFAULT FALSE"))
+            except Exception:
+                pass
+        if "is_active" not in stops_columns:
+            try:
+                connection.execute(text("ALTER TABLE stops ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+            except Exception:
+                pass
+        if "created_by_student_id" not in stops_columns:
+            try:
+                connection.execute(text("ALTER TABLE stops ADD COLUMN created_by_student_id INTEGER REFERENCES students(id)"))
+            except Exception:
+                pass
+
+    temp_change_columns = {column["name"] for column in inspect(engine).get_columns("temporary_stop_changes")}
+    with engine.begin() as connection:
+        if "selected_latitude" not in temp_change_columns:
+            try:
+                connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN selected_latitude FLOAT"))
+            except Exception:
+                pass
+        if "selected_longitude" not in temp_change_columns:
+            try:
+                connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN selected_longitude FLOAT"))
+            except Exception:
+                pass
+        if "selected_address" not in temp_change_columns:
+            try:
+                connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN selected_address VARCHAR(255)"))
             except Exception:
                 pass
 
@@ -1635,7 +1674,7 @@ def get_active_temporary_stop_change(db: Session, student_id: int, on_date: date
         db.query(TemporaryStopChange)
         .filter(
             TemporaryStopChange.student_id == student_id,
-            TemporaryStopChange.status.in_("scheduled", "active"),
+            TemporaryStopChange.status.in_(["scheduled", "active"]),
             TemporaryStopChange.start_date <= effective_date,
             TemporaryStopChange.end_date >= effective_date,
         )
@@ -1645,38 +1684,134 @@ def get_active_temporary_stop_change(db: Session, student_id: int, on_date: date
     return change
 
 
-def expire_temporary_stop_changes(db: Session, student_id: int | None = None):
-    today = date.today()
-    query = db.query(TemporaryStopChange).filter(
-        TemporaryStopChange.end_date < today,
-        TemporaryStopChange.status.in_("scheduled", "active")
-    )
-    if student_id is not None:
-        query = query.filter(TemporaryStopChange.student_id == student_id)
-    changes = query.all()
-    for change in changes:
-        change.status = "expired"
-    if changes:
-        db.commit()
-
-
 def get_effective_student_stop(db: Session, student: Student):
+    """Return the currently effective stop, preferring an active temporary stop."""
     expire_temporary_stop_changes(db, student.id)
     temp_change = get_active_temporary_stop_change(db, student.id)
     if temp_change:
         temp_stop = db.query(Stop).filter(Stop.id == temp_change.temporary_stop_id).first()
-        if temp_stop:
+        if temp_stop and temp_stop.is_active:
             return temp_stop, temp_change
-    original_stop = db.query(Stop).filter(Stop.id == student.stop_id).first() if student.stop_id else None
+
+    original_stop = (
+        db.query(Stop).filter(Stop.id == student.stop_id).first()
+        if student.stop_id
+        else None
+    )
     return original_stop, None
 
+
+def _deactivate_custom_stop(db: Session, change: TemporaryStopChange) -> None:
+    """Soft-retire the custom Stop tied to an expired/cancelled change."""
+    stop = db.query(Stop).filter(Stop.id == change.temporary_stop_id).first()
+    if stop and stop.is_custom and stop.is_active:
+        stop.is_active = False
+
+
+def expire_temporary_stop_changes(db: Session, student_id: int | None = None):
+    today = date.today()
+    query = db.query(TemporaryStopChange).filter(
+        TemporaryStopChange.end_date < today,
+        TemporaryStopChange.status.in_(["scheduled", "active"]),
+    )
+    if student_id is not None:
+        query = query.filter(TemporaryStopChange.student_id == student_id)
+
+    changes = query.all()
+    for change in changes:
+        change.status = "expired"
+        _deactivate_custom_stop(db, change)
+
+    if changes:
+        db.commit()
+
+
+def is_point_on_route(
+    db: Session,
+    route_id: int,
+    latitude: float,
+    longitude: float,
+) -> bool:
+    """Validate that a selected map point is close enough to an active route stop."""
+    route_stops = (
+        db.query(Stop)
+        .filter(Stop.route_id == route_id, Stop.is_active == True)  # noqa: E712
+        .all()
+    )
+
+    for stop in route_stops:
+        if stop.latitude is None or stop.longitude is None:
+            continue
+        if haversine_km(latitude, longitude, stop.latitude, stop.longitude) <= MAX_TEMP_STOP_DISTANCE_KM:
+            return True
+    return False
+
+
+def reverse_geocode(latitude: float, longitude: float) -> str | None:
+    """Best-effort reverse geocoding for a display label; never blocks a valid request."""
+    try:
+        response = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"lat": latitude, "lon": longitude, "format": "json"},
+            headers={"User-Agent": "kambus-app/1.0"},
+            timeout=3,
+        )
+        if response.ok:
+            data = response.json()
+            return data.get("display_name")
+    except requests.RequestException:
+        pass
+    return None
+
+
+def get_or_create_custom_stop(
+    db: Session,
+    route_id: int,
+    latitude: float,
+    longitude: float,
+    address: str | None,
+    student_id: int,
+) -> Stop:
+    """Create a one-off custom Stop for this student's temporary selection."""
+    name = address or reverse_geocode(latitude, longitude) or "Custom Stop"
+
+    # Stop.stop_order is non-nullable in the existing schema. Put custom stops
+    # after the existing route stops so normal ordering remains deterministic.
+    max_stop_order = (
+        db.query(func.max(Stop.stop_order))
+        .filter(Stop.route_id == route_id)
+        .scalar()
+    )
+    next_stop_order = int(max_stop_order or 0) + 1
+
+    stop = Stop(
+        route_id=route_id,
+        name=name[:100],
+        latitude=latitude,
+        longitude=longitude,
+        stop_order=next_stop_order,
+        is_custom=True,
+        is_active=True,
+        created_by_student_id=student_id,
+    )
+    db.add(stop)
+    db.flush()
+    return stop
+
+
+MAX_TEMP_STOP_DISTANCE_KM = 1.5
+
+
+# ============================================================
+# AUTOMATIC MISSED-BUS ALLOTMENT
+# ============================================================
 
 def get_active_missed_bus_allotment(db: Session, student_id: int):
     allotment = (
         db.query(MissedBusAllotment)
         .filter(
             MissedBusAllotment.student_id == student_id,
-            MissedBusAllotment.status == "active"
+            MissedBusAllotment.status == "active",
         )
         .order_by(MissedBusAllotment.created_at.desc())
         .first()
@@ -1684,8 +1819,16 @@ def get_active_missed_bus_allotment(db: Session, student_id: int):
     if not allotment:
         return None
 
-    trip = db.query(Trip).filter(Trip.id == allotment.alternative_trip_id).first() if allotment.alternative_trip_id else None
-    if trip and trip.status == "active" and (allotment.expires_at is None or allotment.expires_at > datetime.utcnow()):
+    trip = (
+        db.query(Trip)
+        .filter(Trip.id == allotment.alternative_trip_id)
+        .first()
+        if allotment.alternative_trip_id
+        else None
+    )
+    if trip and trip.status == "active" and (
+        allotment.expires_at is None or allotment.expires_at > datetime.utcnow()
+    ):
         return allotment
 
     allotment.status = "completed"
@@ -1711,7 +1854,7 @@ def choose_alternative_bus_for_student(
             Trip.status == "active",
             Trip.route_id == original_bus.route_id,
             Trip.bus_id != original_bus.id,
-            Bus.status == "active"
+            Bus.status == "active",
         )
         .order_by(Trip.started_at.asc())
         .all()
@@ -1722,7 +1865,6 @@ def choose_alternative_bus_for_student(
         bus = db.query(Bus).filter(Bus.id == trip.bus_id).first()
         if not bus:
             continue
-
         if has_passed_stop(db, trip, stop):
             continue
 
@@ -1740,11 +1882,14 @@ def choose_alternative_bus_for_student(
                 current_latitude,
                 current_longitude,
                 location.latitude,
-                location.longitude
+                location.longitude,
             )
 
-        # Lower score is better: ETA is the primary signal; proximity is a tie-breaker.
-        score = (eta, user_distance if user_distance is not None else 0.0, trip.started_at.timestamp())
+        score = (
+            eta,
+            user_distance if user_distance is not None else 0.0,
+            trip.started_at.timestamp(),
+        )
         candidates.append((score, bus, trip, eta, location))
 
     if not candidates:
@@ -1759,7 +1904,7 @@ def choose_alternative_bus_for_student(
 def automatically_allot_alternative_bus(
     data: MissedBusAllotmentRequest,
     db: Session = Depends(get_db),
-    current_student: dict = Depends(require_student)
+    current_student: dict = Depends(require_student),
 ):
     student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
     if not student:
@@ -1774,7 +1919,13 @@ def automatically_allot_alternative_bus(
     active_allotment = get_active_missed_bus_allotment(db, student.id)
     if active_allotment:
         bus = db.query(Bus).filter(Bus.id == active_allotment.alternative_bus_id).first()
-        trip = db.query(Trip).filter(Trip.id == active_allotment.alternative_trip_id).first() if active_allotment.alternative_trip_id else None
+        trip = (
+            db.query(Trip)
+            .filter(Trip.id == active_allotment.alternative_trip_id)
+            .first()
+            if active_allotment.alternative_trip_id
+            else None
+        )
         return {
             "success": True,
             "message": "You already have an active alternative bus for this journey",
@@ -1788,7 +1939,7 @@ def automatically_allot_alternative_bus(
         }
 
     original_bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
-    stop, temp_change = get_effective_student_stop(db, student)
+    stop, _ = get_effective_student_stop(db, student)
     if not original_bus or not stop:
         raise HTTPException(status_code=404, detail="Current bus or stop could not be found")
 
@@ -1804,11 +1955,9 @@ def automatically_allot_alternative_bus(
     if not alternative_bus or not alternative_trip:
         raise HTTPException(
             status_code=409,
-            detail="No suitable alternative bus is currently available for your stop"
+            detail="No suitable alternative bus is currently available for your stop",
         )
 
-    # The alternative assignment belongs only to this active trip. The student's
-    # permanent Student.bus_id is intentionally left unchanged.
     allotment = MissedBusAllotment(
         student_id=student.id,
         original_bus_id=original_bus.id,
@@ -1839,7 +1988,7 @@ def automatically_allot_alternative_bus(
             "eta_minutes": eta,
         },
         related_bus_id=alternative_bus.id,
-        related_trip_id=alternative_trip.id
+        related_trip_id=alternative_trip.id,
     )
     db.commit()
 
@@ -1862,7 +2011,7 @@ def automatically_allot_alternative_bus(
 @app.get("/student/missed-bus/allotment")
 def get_alternative_bus_allotment(
     db: Session = Depends(get_db),
-    current_student: dict = Depends(require_student)
+    current_student: dict = Depends(require_student),
 ):
     student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
     if not student:
@@ -1873,7 +2022,11 @@ def get_alternative_bus_allotment(
         return {"active": False}
 
     bus = db.query(Bus).filter(Bus.id == allotment.alternative_bus_id).first()
-    trip = db.query(Trip).filter(Trip.id == allotment.alternative_trip_id).first() if allotment.alternative_trip_id else None
+    trip = (
+        db.query(Trip).filter(Trip.id == allotment.alternative_trip_id).first()
+        if allotment.alternative_trip_id
+        else None
+    )
     stop = db.query(Stop).filter(Stop.id == allotment.stop_id).first()
 
     return {
@@ -1892,17 +2045,24 @@ def get_alternative_bus_allotment(
     }
 
 
+# ============================================================
+# MAP-BASED TEMPORARY STOP
+# ============================================================
+
 @app.post("/student/temporary-stop-change")
 def create_temporary_stop_change(
     data: TemporaryStopChangeCreate,
     db: Session = Depends(get_db),
-    current_student: dict = Depends(require_student)
+    current_student: dict = Depends(require_student),
 ):
     student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student profile not found")
     if not student.bus_id or not student.stop_id:
-        raise HTTPException(status_code=400, detail="A regular bus and stop must be assigned before using temporary stop change")
+        raise HTTPException(
+            status_code=400,
+            detail="A regular bus and stop must be assigned before using temporary stop change",
+        )
     if data.start_date > data.end_date:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
     if (data.end_date - data.start_date).days > 30:
@@ -1910,26 +2070,40 @@ def create_temporary_stop_change(
 
     original_bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
     original_stop = db.query(Stop).filter(Stop.id == student.stop_id).first()
-    temporary_stop = db.query(Stop).filter(Stop.id == data.temporary_stop_id).first()
-    if not original_bus or not original_stop or not temporary_stop:
+    if not original_bus or not original_stop:
         raise HTTPException(status_code=404, detail="Bus or stop not found")
     if original_bus.route_id is None:
         raise HTTPException(status_code=400, detail="Your assigned bus has no route")
     if original_stop.route_id != original_bus.route_id:
         raise HTTPException(status_code=409, detail="Your assigned stop does not belong to your bus route")
-    if temporary_stop.route_id != original_bus.route_id:
-        raise HTTPException(status_code=400, detail="Temporary stop must belong to your assigned bus route")
-    if temporary_stop.id == original_stop.id:
-        raise HTTPException(status_code=400, detail="Temporary stop must be different from your regular stop")
 
-    overlapping = db.query(TemporaryStopChange).filter(
-        TemporaryStopChange.student_id == student.id,
-        TemporaryStopChange.status.in_(["scheduled", "active"]),
-        TemporaryStopChange.start_date <= data.end_date,
-        TemporaryStopChange.end_date >= data.start_date,
-    ).first()
+    if not is_point_on_route(db, original_bus.route_id, data.latitude, data.longitude):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Selected location is too far from your route (must be within {MAX_TEMP_STOP_DISTANCE_KM} km of a stop on it)",
+        )
+
+    overlapping = (
+        db.query(TemporaryStopChange)
+        .filter(
+            TemporaryStopChange.student_id == student.id,
+            TemporaryStopChange.status.in_(["scheduled", "active"]),
+            TemporaryStopChange.start_date <= data.end_date,
+            TemporaryStopChange.end_date >= data.start_date,
+        )
+        .first()
+    )
     if overlapping:
         raise HTTPException(status_code=409, detail="You already have an overlapping temporary stop change")
+
+    temporary_stop = get_or_create_custom_stop(
+        db,
+        route_id=original_bus.route_id,
+        latitude=data.latitude,
+        longitude=data.longitude,
+        address=data.address,
+        student_id=student.id,
+    )
 
     status_value = "active" if data.start_date <= date.today() <= data.end_date else "scheduled"
     change = TemporaryStopChange(
@@ -1940,6 +2114,9 @@ def create_temporary_stop_change(
         end_date=data.end_date,
         status=status_value,
         created_at=datetime.utcnow(),
+        selected_latitude=data.latitude,
+        selected_longitude=data.longitude,
+        selected_address=temporary_stop.name,
     )
     db.add(change)
     db.commit()
@@ -1953,6 +2130,8 @@ def create_temporary_stop_change(
         "original_stop_name": original_stop.name,
         "temporary_stop_id": temporary_stop.id,
         "temporary_stop_name": temporary_stop.name,
+        "temporary_latitude": temporary_stop.latitude,
+        "temporary_longitude": temporary_stop.longitude,
         "start_date": change.start_date,
         "end_date": change.end_date,
         "status": change.status,
@@ -1962,7 +2141,7 @@ def create_temporary_stop_change(
 @app.get("/student/temporary-stop-change")
 def get_temporary_stop_change(
     db: Session = Depends(get_db),
-    current_student: dict = Depends(require_student)
+    current_student: dict = Depends(require_student),
 ):
     student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
     if not student:
@@ -1992,7 +2171,9 @@ def get_temporary_stop_change(
         "original_stop_id": change.original_stop_id,
         "original_stop_name": original_stop.name if original_stop else None,
         "temporary_stop_id": change.temporary_stop_id,
-        "temporary_stop_name": temporary_stop.name if temporary_stop else None,
+        "temporary_stop_name": temporary_stop.name if temporary_stop else change.selected_address,
+        "temporary_latitude": temporary_stop.latitude if temporary_stop else change.selected_latitude,
+        "temporary_longitude": temporary_stop.longitude if temporary_stop else change.selected_longitude,
         "start_date": change.start_date,
         "end_date": change.end_date,
     }
@@ -2001,7 +2182,7 @@ def get_temporary_stop_change(
 @app.delete("/student/temporary-stop-change")
 def cancel_temporary_stop_change(
     db: Session = Depends(get_db),
-    current_student: dict = Depends(require_student)
+    current_student: dict = Depends(require_student),
 ):
     student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
     if not student:
@@ -2020,6 +2201,7 @@ def cancel_temporary_stop_change(
         raise HTTPException(status_code=404, detail="No active or scheduled temporary stop change found")
 
     change.status = "cancelled"
+    _deactivate_custom_stop(db, change)
     db.commit()
     return {"success": True, "message": "Temporary stop change cancelled", "request_id": change.id}
 
@@ -2027,7 +2209,7 @@ def cancel_temporary_stop_change(
 @app.get("/student/effective-stop")
 def get_student_effective_stop(
     db: Session = Depends(get_db),
-    current_student: dict = Depends(require_student)
+    current_student: dict = Depends(require_student),
 ):
     student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
     if not student:
@@ -2048,6 +2230,7 @@ def get_student_effective_stop(
         "bus_id": bus.id if bus else None,
         "bus_number": bus.bus_number if bus else None,
         "is_temporary": change is not None,
+        "is_custom_point": bool(stop.is_custom) if change is not None else False,
         "temporary_change_id": change.id if change else None,
         "temporary_start_date": change.start_date if change else None,
         "temporary_end_date": change.end_date if change else None,
