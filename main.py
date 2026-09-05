@@ -4221,6 +4221,47 @@ def admin_global_search(q: str, db: Session = Depends(get_db), current_user: dic
 # 12. ADMIN ACTIVITY LOGS
 # ------------------------------------------------------------
 
+@app.get("/admin/geofence-logs")
+def list_admin_geofence_logs(
+    bus_id: int | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    query = db.query(BusEntryLog)
+
+    if bus_id is not None:
+        query = query.filter(BusEntryLog.bus_id == bus_id)
+    if start_date is not None:
+        query = query.filter(BusEntryLog.entry_time >= datetime.combine(start_date, datetime.min.time()))
+    if end_date is not None:
+        query = query.filter(
+            BusEntryLog.entry_time < datetime.combine(end_date + timedelta(days=1), datetime.min.time())
+        )
+
+    logs = query.order_by(BusEntryLog.entry_time.desc()).all()
+    result = []
+    for log in logs:
+        bus = db.query(Bus).filter(Bus.id == log.bus_id).first()
+        trip = db.query(Trip).filter(Trip.id == log.trip_id).first()
+        driver_id = trip.driver_id if trip and trip.driver_id else bus.driver_id if bus else None
+        driver = db.query(Driver).filter(Driver.id == driver_id).first() if driver_id else None
+        driver_user = db.query(User).filter(User.id == driver.user_id).first() if driver else None
+
+        result.append({
+            "id": log.id,
+            "bus_id": log.bus_id,
+            "bus_number": bus.bus_number if bus else None,
+            "trip_id": log.trip_id,
+            "driver_name": driver_user.name if driver_user else None,
+            "entry_time": to_utc_iso(log.entry_time),
+            "latitude": log.latitude,
+            "longitude": log.longitude
+        })
+
+    return {"logs": result}
+
 @app.get("/admin/activity-logs")
 def get_admin_activity_logs(
     limit: int = 50,
