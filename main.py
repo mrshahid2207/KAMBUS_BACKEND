@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.orm import Session
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, text, func
 from datetime import datetime, timedelta, date
 from math import asin, cos, radians, sin, sqrt, atan2
 import json
@@ -8,6 +8,8 @@ import logging
 import asyncio
 import hashlib
 import hmac
+import urllib.request
+import urllib.parse
 
 from database import Base, engine, SessionLocal
 from models import (
@@ -28,7 +30,9 @@ from models import (
     ComplaintVerification,
     AdminActivityLog,
     AnnouncementHistory,
-    StudentOTP
+    StudentOTP,
+    MissedBusAllotment,
+    TemporaryStopChange
 )
 from schemas import (
     LoginRequest,
@@ -69,7 +73,9 @@ from schemas import (
     StudentSignupRequest,
     StudentVerifyOtpRequest,
     StudentResendOtpRequest,
-    StudentSelectStopRequest
+    StudentSelectStopRequest,
+    TemporaryStopChangeCreate,
+    MissedBusAllotmentRequest
 )
 from email_service import generate_otp_code, send_student_verification_email
 from notification_service import send_notification
@@ -97,6 +103,10 @@ ALLOWED_COMPLAINT_REASONS = [
     "improper_behaviour",
     "other"
 ]
+
+# Complaint corroboration thresholds — tune these based on pitch/demo feedback
+COMPLAINT_MIN_VOTES = 2
+COMPLAINT_MIN_YES_RATIO = 0.6  # 60% of respondents must vote yes
 
 app = FastAPI(title="KAMBUS API")
 
@@ -186,48 +196,23 @@ async def websocket_notifications(
 
 @app.on_event("startup")
 def initialize_trip_database():
-    from database import engine
-    from models import Trip
+    from database import Base, engine
+    from models import (
+        Trip,
+        Notification,
+        DeviceToken,
+        DriverComplaint,
+        ComplaintVerification,
+        AdminActivityLog,
+        AnnouncementHistory,
+        StudentOTP,
+        MissedBusAllotment,
+        TemporaryStopChange,
+        Stop
+    )
 
+    # 1. Ensure all core tables exist
     Trip.__table__.create(bind=engine, checkfirst=True)
-
-    inspector = inspect(engine)
-    columns = {
-        column["name"]
-        for column in inspector.get_columns("bus_locations")
-    }
-
-    if "trip_id" not in columns:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    """
-                    ALTER TABLE bus_locations
-                    ADD COLUMN trip_id INTEGER
-                    REFERENCES trips(id)
-                    """
-                )
-            )
-
-    student_columns = {column["name"] for column in inspector.get_columns("students")}
-    if "stop_id" not in student_columns:
-        with engine.begin() as connection:
-            connection.execute(text("ALTER TABLE students ADD COLUMN stop_id INTEGER REFERENCES stops(id)"))
-
-    user_columns = {column["name"] for column in inspector.get_columns("users")}
-    if "email" not in user_columns:
-        with engine.begin() as connection:
-            try:
-                connection.execute(text("ALTER TABLE users ADD COLUMN email VARCHAR(120)"))
-            except Exception:
-                pass
-    if "is_verified" not in user_columns:
-        with engine.begin() as connection:
-            try:
-                connection.execute(text("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 1"))
-            except Exception:
-                pass
-
     Notification.__table__.create(bind=engine, checkfirst=True)
     DeviceToken.__table__.create(bind=engine, checkfirst=True)
     DriverComplaint.__table__.create(bind=engine, checkfirst=True)
@@ -235,6 +220,82 @@ def initialize_trip_database():
     AdminActivityLog.__table__.create(bind=engine, checkfirst=True)
     AnnouncementHistory.__table__.create(bind=engine, checkfirst=True)
     StudentOTP.__table__.create(bind=engine, checkfirst=True)
+    MissedBusAllotment.__table__.create(bind=engine, checkfirst=True)
+    TemporaryStopChange.__table__.create(bind=engine, checkfirst=True)
+
+    # 2. Non-destructive column additions
+    inspector = inspect(engine)
+
+    if inspector.has_table("bus_locations"):
+        bus_loc_cols = {col["name"] for col in inspector.get_columns("bus_locations")}
+        if "trip_id" not in bus_loc_cols:
+            with engine.begin() as connection:
+                try:
+                    connection.execute(text("ALTER TABLE bus_locations ADD COLUMN trip_id INTEGER REFERENCES trips(id)"))
+                except Exception:
+                    pass
+
+    if inspector.has_table("students"):
+        student_cols = {col["name"] for col in inspector.get_columns("students")}
+        if "stop_id" not in student_cols:
+            with engine.begin() as connection:
+                try:
+                    connection.execute(text("ALTER TABLE students ADD COLUMN stop_id INTEGER REFERENCES stops(id)"))
+                except Exception:
+                    pass
+
+    if inspector.has_table("users"):
+        user_cols = {col["name"] for col in inspector.get_columns("users")}
+        if "email" not in user_cols:
+            with engine.begin() as connection:
+                try:
+                    connection.execute(text("ALTER TABLE users ADD COLUMN email VARCHAR(120)"))
+                except Exception:
+                    pass
+        if "is_verified" not in user_cols:
+            with engine.begin() as connection:
+                try:
+                    connection.execute(text("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 1"))
+                except Exception:
+                    pass
+
+    if inspector.has_table("stops"):
+        stop_cols = {col["name"] for col in inspector.get_columns("stops")}
+        with engine.begin() as connection:
+            if "is_custom" not in stop_cols:
+                try:
+                    connection.execute(text("ALTER TABLE stops ADD COLUMN is_custom BOOLEAN NOT NULL DEFAULT FALSE"))
+                except Exception:
+                    pass
+            if "is_active" not in stop_cols:
+                try:
+                    connection.execute(text("ALTER TABLE stops ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+                except Exception:
+                    pass
+            if "created_by_student_id" not in stop_cols:
+                try:
+                    connection.execute(text("ALTER TABLE stops ADD COLUMN created_by_student_id INTEGER REFERENCES students(id)"))
+                except Exception:
+                    pass
+
+    if inspector.has_table("temporary_stop_changes"):
+        temp_cols = {col["name"] for col in inspector.get_columns("temporary_stop_changes")}
+        with engine.begin() as connection:
+            if "selected_latitude" not in temp_cols:
+                try:
+                    connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN selected_latitude FLOAT"))
+                except Exception:
+                    pass
+            if "selected_longitude" not in temp_cols:
+                try:
+                    connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN selected_longitude FLOAT"))
+                except Exception:
+                    pass
+            if "selected_address" not in temp_cols:
+                try:
+                    connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN selected_address VARCHAR(255)"))
+                except Exception:
+                    pass
 
 
 WAIT_BUDGET_PER_TRIP = 10
@@ -329,12 +390,25 @@ def has_passed_stop(db: Session, trip: Trip, stop: Stop) -> bool:
     if not location:
         return False
 
+    # Query regular active stops along the route
     route_stops = (
         db.query(Stop)
-        .filter(Stop.route_id == trip.route_id)
+        .filter(
+            Stop.route_id == trip.route_id,
+            Stop.is_active == True,
+            Stop.is_custom == False
+        )
         .order_by(Stop.stop_order.asc())
         .all()
     )
+    if not route_stops:
+        # Fallback to all stops if no active flag is populated
+        route_stops = (
+            db.query(Stop)
+            .filter(Stop.route_id == trip.route_id)
+            .order_by(Stop.stop_order.asc())
+            .all()
+        )
     if not route_stops:
         return False
 
@@ -354,7 +428,20 @@ def has_passed_stop(db: Session, trip: Trip, stop: Stop) -> bool:
     if not nearest_stop:
         return False
 
-    return nearest_stop.stop_order > stop.stop_order
+    # If the target stop is a custom stop, find its nearest regular route stop as reference
+    target_stop_order = stop.stop_order
+    if getattr(stop, "is_custom", False):
+        ref_stop = None
+        ref_dist = float("inf")
+        for route_stop in route_stops:
+            dist = haversine_km(stop.latitude, stop.longitude, route_stop.latitude, route_stop.longitude)
+            if dist < ref_dist:
+                ref_dist = dist
+                ref_stop = route_stop
+        if ref_stop:
+            target_stop_order = ref_stop.stop_order
+
+    return nearest_stop.stop_order > target_stop_order
 
 
 def active_student_request_exists(db: Session, student_id: int, trip_id: int) -> bool:
@@ -1566,7 +1653,12 @@ def get_student_route_stops(
     if bus.route_id is None:
         raise HTTPException(status_code=404, detail="No route assigned to this bus")
 
-    stops = db.query(Stop).filter(Stop.route_id == bus.route_id).order_by(Stop.stop_order.asc()).all()
+    stops = (
+        db.query(Stop)
+        .filter(Stop.route_id == bus.route_id, Stop.is_active == True)
+        .order_by(Stop.stop_order.asc())
+        .all()
+    )
 
     return {
         "bus_id": bus.id,
@@ -1585,6 +1677,241 @@ def get_student_route_stops(
     }
 
 
+# ============================================================
+# AUTOMATIC STUDENT BUS / STOP FEATURES & HELPERS
+# ============================================================
+
+MAX_TEMP_STOP_DISTANCE_KM = 1.5
+
+
+def reverse_geocode(latitude: float, longitude: float) -> str | None:
+    """Best-effort reverse geocoding with standard library fallback; never blocks a valid request."""
+    url = f"https://nominatim.openstreetmap.org/reverse?lat={latitude}&lon={longitude}&format=json"
+    headers = {"User-Agent": "KAMBUS-App/1.0 (campus-transport)"}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=2.0) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode("utf-8"))
+                return data.get("display_name")
+    except Exception:
+        pass
+    return None
+
+
+def is_point_on_route(
+    db: Session,
+    route_id: int,
+    latitude: float,
+    longitude: float,
+) -> bool:
+    """Validate that a selected map point is close enough to an active route stop."""
+    route_stops = (
+        db.query(Stop)
+        .filter(Stop.route_id == route_id, Stop.is_active == True, Stop.is_custom == False)
+        .all()
+    )
+    if not route_stops:
+        route_stops = (
+            db.query(Stop)
+            .filter(Stop.route_id == route_id)
+            .all()
+        )
+
+    for stop in route_stops:
+        if stop.latitude is None or stop.longitude is None:
+            continue
+        if haversine_km(latitude, longitude, stop.latitude, stop.longitude) <= MAX_TEMP_STOP_DISTANCE_KM:
+            return True
+    return False
+
+
+def get_or_create_custom_stop(
+    db: Session,
+    route_id: int,
+    latitude: float,
+    longitude: float,
+    address: str | None,
+    student_id: int,
+) -> Stop:
+    """Create a one-off custom Stop for this student's temporary selection."""
+    name = address or reverse_geocode(latitude, longitude) or "Custom Stop"
+
+    max_stop_order = (
+        db.query(func.max(Stop.stop_order))
+        .filter(Stop.route_id == route_id)
+        .scalar()
+    )
+    next_stop_order = int(max_stop_order or 0) + 1
+
+    stop = Stop(
+        route_id=route_id,
+        name=name[:100],
+        latitude=latitude,
+        longitude=longitude,
+        stop_order=next_stop_order,
+        is_custom=True,
+        is_active=True,
+        created_by_student_id=student_id,
+    )
+    db.add(stop)
+    db.flush()
+    return stop
+
+
+def _deactivate_custom_stop(db: Session, change: TemporaryStopChange) -> None:
+    """Soft-retire the custom Stop tied to an expired/cancelled change."""
+    if change and change.temporary_stop_id:
+        stop = db.query(Stop).filter(Stop.id == change.temporary_stop_id).first()
+        if stop and getattr(stop, "is_custom", False) and getattr(stop, "is_active", True):
+            stop.is_active = False
+
+
+def expire_temporary_stop_changes(db: Session, student_id: int | None = None):
+    today = date.today()
+    query = db.query(TemporaryStopChange).filter(
+        TemporaryStopChange.end_date < today,
+        TemporaryStopChange.status.in_(["scheduled", "active"]),
+    )
+    if student_id is not None:
+        query = query.filter(TemporaryStopChange.student_id == student_id)
+
+    changes = query.all()
+    for change in changes:
+        change.status = "expired"
+        _deactivate_custom_stop(db, change)
+
+    if changes:
+        db.commit()
+
+
+def get_active_temporary_stop_change(db: Session, student_id: int, on_date: date | None = None):
+    effective_date = on_date or date.today()
+    change = (
+        db.query(TemporaryStopChange)
+        .filter(
+            TemporaryStopChange.student_id == student_id,
+            TemporaryStopChange.status.in_(["scheduled", "active"]),
+            TemporaryStopChange.start_date <= effective_date,
+            TemporaryStopChange.end_date >= effective_date,
+        )
+        .order_by(TemporaryStopChange.created_at.desc())
+        .first()
+    )
+    return change
+
+
+def get_effective_student_stop(db: Session, student: Student):
+    """Return the currently effective stop, preferring an active temporary stop."""
+    expire_temporary_stop_changes(db, student.id)
+    temp_change = get_active_temporary_stop_change(db, student.id)
+    if temp_change:
+        temp_stop = db.query(Stop).filter(Stop.id == temp_change.temporary_stop_id).first()
+        if temp_stop and getattr(temp_stop, "is_active", True):
+            return temp_stop, temp_change
+
+    original_stop = (
+        db.query(Stop).filter(Stop.id == student.stop_id).first()
+        if student.stop_id
+        else None
+    )
+    return original_stop, None
+
+
+def get_active_missed_bus_allotment(db: Session, student_id: int):
+    allotment = (
+        db.query(MissedBusAllotment)
+        .filter(
+            MissedBusAllotment.student_id == student_id,
+            MissedBusAllotment.status == "active",
+        )
+        .order_by(MissedBusAllotment.created_at.desc())
+        .first()
+    )
+    if not allotment:
+        return None
+
+    trip = (
+        db.query(Trip)
+        .filter(Trip.id == allotment.alternative_trip_id)
+        .first()
+        if allotment.alternative_trip_id
+        else None
+    )
+    if trip and trip.status == "active" and (
+        allotment.expires_at is None or allotment.expires_at > datetime.utcnow()
+    ):
+        return allotment
+
+    allotment.status = "completed"
+    db.commit()
+    return None
+
+
+def choose_alternative_bus_for_student(
+    db: Session,
+    student: Student,
+    stop: Stop,
+    original_bus: Bus,
+    current_latitude: float | None = None,
+    current_longitude: float | None = None,
+):
+    if original_bus.route_id is None:
+        return None, None, None
+
+    active_trips = (
+        db.query(Trip)
+        .join(Bus, Bus.id == Trip.bus_id)
+        .filter(
+            Trip.status == "active",
+            Trip.route_id == original_bus.route_id,
+            Trip.bus_id != original_bus.id,
+            Bus.status == "active",
+        )
+        .order_by(Trip.started_at.asc())
+        .all()
+    )
+
+    candidates = []
+    for trip in active_trips:
+        bus = db.query(Bus).filter(Bus.id == trip.bus_id).first()
+        if not bus:
+            continue
+        if has_passed_stop(db, trip, stop):
+            continue
+
+        location = get_latest_location(db, bus.id, trip.id)
+        if not location:
+            continue
+
+        eta = get_eta_minutes_to_stop(db, bus.id, trip.id, stop)
+        if eta is None:
+            continue
+
+        user_distance = None
+        if current_latitude is not None and current_longitude is not None:
+            user_distance = haversine_km(
+                current_latitude,
+                current_longitude,
+                location.latitude,
+                location.longitude,
+            )
+
+        score = (
+            eta,
+            user_distance if user_distance is not None else 0.0,
+            trip.started_at.timestamp(),
+        )
+        candidates.append((score, bus, trip, eta, location))
+
+    if not candidates:
+        return None, None, None
+
+    candidates.sort(key=lambda item: item[0])
+    _, selected_bus, selected_trip, selected_eta, _ = candidates[0]
+    return selected_bus, selected_trip, selected_eta
+
+
 @app.get("/student/my-stop")
 def get_student_my_stop(
     db: Session = Depends(get_db),
@@ -1598,12 +1925,12 @@ def get_student_my_stop(
     if student.stop_id is None:
         raise HTTPException(status_code=404, detail="No stop assigned to this student")
 
-    bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
-    stop = db.query(Stop).filter(Stop.id == student.stop_id).first()
+    allotment = get_active_missed_bus_allotment(db, student.id)
+    target_bus_id = allotment.alternative_bus_id if allotment else student.bus_id
+    bus = db.query(Bus).filter(Bus.id == target_bus_id).first()
+    stop, temp_change = get_effective_student_stop(db, student)
     if not bus or not stop:
         raise HTTPException(status_code=404, detail="Assigned stop or bus not found")
-    if bus.route_id is None or stop.route_id != bus.route_id:
-        raise HTTPException(status_code=409, detail="Assigned stop does not belong to the student's bus route")
 
     return {
         "stop_id": stop.id,
@@ -1614,7 +1941,324 @@ def get_student_my_stop(
         "route_id": stop.route_id,
         "bus_id": bus.id,
         "bus_number": bus.bus_number,
+        "is_temporary": temp_change is not None,
+        "is_custom_point": bool(getattr(stop, "is_custom", False)) if temp_change is not None else False,
+        "temporary_change_id": temp_change.id if temp_change else None,
+        "temporary_start_date": temp_change.start_date if temp_change else None,
+        "temporary_end_date": temp_change.end_date if temp_change else None,
     }
+
+
+# ============================================================
+# MISSED BUS ALLOTMENT ENDPOINTS
+# ============================================================
+
+@app.post("/student/missed-bus/allot")
+def automatically_allot_alternative_bus(
+    data: MissedBusAllotmentRequest,
+    db: Session = Depends(get_db),
+    current_student: dict = Depends(require_student),
+):
+    student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student profile not found")
+    if not student.bus_id:
+        raise HTTPException(status_code=400, detail="No regular bus is assigned to this student")
+    if not student.stop_id:
+        raise HTTPException(status_code=400, detail="No pickup stop is assigned to this student")
+    if not student_is_travelling_today(db, student.id):
+        raise HTTPException(status_code=400, detail="You marked yourself as not travelling today")
+
+    active_allotment = get_active_missed_bus_allotment(db, student.id)
+    if active_allotment:
+        bus = db.query(Bus).filter(Bus.id == active_allotment.alternative_bus_id).first()
+        trip = (
+            db.query(Trip)
+            .filter(Trip.id == active_allotment.alternative_trip_id)
+            .first()
+            if active_allotment.alternative_trip_id
+            else None
+        )
+        return {
+            "success": True,
+            "message": "You already have an active alternative bus for this journey",
+            "allotment_id": active_allotment.id,
+            "original_bus_id": active_allotment.original_bus_id,
+            "alternative_bus_id": bus.id if bus else None,
+            "alternative_bus_number": bus.bus_number if bus else None,
+            "alternative_trip_id": trip.id if trip else None,
+            "stop_id": active_allotment.stop_id,
+            "status": active_allotment.status,
+        }
+
+    original_bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
+    stop, _ = get_effective_student_stop(db, student)
+    if not original_bus or not stop:
+        raise HTTPException(status_code=404, detail="Current bus or stop could not be found")
+
+    original_trip = get_active_trip_for_bus(db, original_bus.id)
+    alternative_bus, alternative_trip, eta = choose_alternative_bus_for_student(
+        db,
+        student,
+        stop,
+        original_bus,
+        data.latitude,
+        data.longitude,
+    )
+    if not alternative_bus or not alternative_trip:
+        raise HTTPException(
+            status_code=409,
+            detail="No suitable alternative bus is currently available for your stop",
+        )
+
+    allotment = MissedBusAllotment(
+        student_id=student.id,
+        original_bus_id=original_bus.id,
+        alternative_bus_id=alternative_bus.id,
+        original_trip_id=original_trip.id if original_trip else None,
+        alternative_trip_id=alternative_trip.id,
+        stop_id=stop.id,
+        status="active",
+        created_at=datetime.utcnow(),
+        expires_at=(alternative_trip.started_at + timedelta(hours=6)) if alternative_trip.started_at else None,
+    )
+    db.add(allotment)
+    db.commit()
+    db.refresh(allotment)
+
+    send_notification(
+        db,
+        student.user_id,
+        "Alternative Bus Allotted",
+        f"{alternative_bus.bus_number} has been automatically allotted because you missed {original_bus.bus_number}.",
+        "alternative_bus_allotted",
+        {
+            "allotment_id": allotment.id,
+            "original_bus_id": original_bus.id,
+            "alternative_bus_id": alternative_bus.id,
+            "alternative_trip_id": alternative_trip.id,
+            "stop_id": stop.id,
+            "eta_minutes": eta,
+        },
+        related_bus_id=alternative_bus.id,
+        related_trip_id=alternative_trip.id,
+    )
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "Alternative bus allotted automatically",
+        "allotment_id": allotment.id,
+        "original_bus_id": original_bus.id,
+        "original_bus_number": original_bus.bus_number,
+        "alternative_bus_id": alternative_bus.id,
+        "alternative_bus_number": alternative_bus.bus_number,
+        "alternative_trip_id": alternative_trip.id,
+        "stop_id": stop.id,
+        "stop_name": stop.name,
+        "eta_minutes": eta,
+        "status": allotment.status,
+    }
+
+
+@app.get("/student/missed-bus/allotment")
+def get_alternative_bus_allotment(
+    db: Session = Depends(get_db),
+    current_student: dict = Depends(require_student),
+):
+    student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student profile not found")
+
+    allotment = get_active_missed_bus_allotment(db, student.id)
+    if not allotment:
+        return {"active": False}
+
+    bus = db.query(Bus).filter(Bus.id == allotment.alternative_bus_id).first()
+    trip = (
+        db.query(Trip).filter(Trip.id == allotment.alternative_trip_id).first()
+        if allotment.alternative_trip_id
+        else None
+    )
+    stop = db.query(Stop).filter(Stop.id == allotment.stop_id).first()
+
+    return {
+        "active": True,
+        "allotment_id": allotment.id,
+        "original_bus_id": allotment.original_bus_id,
+        "alternative_bus_id": allotment.alternative_bus_id,
+        "alternative_bus_number": bus.bus_number if bus else None,
+        "alternative_trip_id": allotment.alternative_trip_id,
+        "stop_id": stop.id if stop else None,
+        "stop_name": stop.name if stop else None,
+        "status": allotment.status,
+        "created_at": to_utc_iso(allotment.created_at),
+        "expires_at": to_utc_iso(allotment.expires_at),
+        "trip_active": bool(trip and trip.status == "active"),
+    }
+
+
+# ============================================================
+# MAP-BASED TEMPORARY STOP ENDPOINTS
+# ============================================================
+
+@app.post("/student/temporary-stop-change")
+def create_temporary_stop_change(
+    data: TemporaryStopChangeCreate,
+    db: Session = Depends(get_db),
+    current_student: dict = Depends(require_student),
+):
+    student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student profile not found")
+    if not student.bus_id or not student.stop_id:
+        raise HTTPException(
+            status_code=400,
+            detail="A regular bus and stop must be assigned before using temporary stop change",
+        )
+    if data.start_date > data.end_date:
+        raise HTTPException(status_code=400, detail="Start date cannot be after end date")
+    if (data.end_date - data.start_date).days > 30:
+        raise HTTPException(status_code=400, detail="Temporary stop changes can be scheduled for at most 31 days")
+
+    original_bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
+    original_stop = db.query(Stop).filter(Stop.id == student.stop_id).first()
+    if not original_bus or not original_stop:
+        raise HTTPException(status_code=404, detail="Bus or stop not found")
+    if original_bus.route_id is None:
+        raise HTTPException(status_code=400, detail="Your assigned bus has no route")
+    if original_stop.route_id != original_bus.route_id:
+        raise HTTPException(status_code=409, detail="Your assigned stop does not belong to your bus route")
+
+    if not is_point_on_route(db, original_bus.route_id, data.latitude, data.longitude):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Selected location is too far from your route (must be within {MAX_TEMP_STOP_DISTANCE_KM} km of a stop on it)",
+        )
+
+    overlapping = (
+        db.query(TemporaryStopChange)
+        .filter(
+            TemporaryStopChange.student_id == student.id,
+            TemporaryStopChange.status.in_(["scheduled", "active"]),
+            TemporaryStopChange.start_date <= data.end_date,
+            TemporaryStopChange.end_date >= data.start_date,
+        )
+        .first()
+    )
+    if overlapping:
+        raise HTTPException(status_code=409, detail="You already have an overlapping temporary stop change")
+
+    temporary_stop = get_or_create_custom_stop(
+        db,
+        route_id=original_bus.route_id,
+        latitude=data.latitude,
+        longitude=data.longitude,
+        address=data.address,
+        student_id=student.id,
+    )
+
+    status_value = "active" if data.start_date <= date.today() <= data.end_date else "scheduled"
+    change = TemporaryStopChange(
+        student_id=student.id,
+        original_stop_id=original_stop.id,
+        temporary_stop_id=temporary_stop.id,
+        start_date=data.start_date,
+        end_date=data.end_date,
+        status=status_value,
+        created_at=datetime.utcnow(),
+        selected_latitude=data.latitude,
+        selected_longitude=data.longitude,
+        selected_address=temporary_stop.name,
+    )
+    db.add(change)
+    db.commit()
+    db.refresh(change)
+
+    return {
+        "success": True,
+        "message": "Temporary stop change scheduled automatically",
+        "request_id": change.id,
+        "original_stop_id": original_stop.id,
+        "original_stop_name": original_stop.name,
+        "temporary_stop_id": temporary_stop.id,
+        "temporary_stop_name": temporary_stop.name,
+        "temporary_latitude": temporary_stop.latitude,
+        "temporary_longitude": temporary_stop.longitude,
+        "start_date": change.start_date,
+        "end_date": change.end_date,
+        "status": change.status,
+    }
+
+
+@app.get("/student/temporary-stop-change")
+def get_temporary_stop_change(
+    db: Session = Depends(get_db),
+    current_student: dict = Depends(require_student),
+):
+    student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student profile not found")
+
+    expire_temporary_stop_changes(db, student.id)
+    change = (
+        db.query(TemporaryStopChange)
+        .filter(TemporaryStopChange.student_id == student.id)
+        .order_by(TemporaryStopChange.created_at.desc())
+        .first()
+    )
+
+    if not change:
+        return {"active": False, "scheduled": False}
+
+    temporary_stop = db.query(Stop).filter(Stop.id == change.temporary_stop_id).first()
+    today = date.today()
+    active = change.start_date <= today <= change.end_date and change.status in ("scheduled", "active")
+    scheduled = change.start_date > today and change.status == "scheduled"
+
+    return {
+        "active": active,
+        "scheduled": scheduled,
+        "request_id": change.id,
+        "status": change.status,
+        "original_stop_id": change.original_stop_id,
+        "temporary_stop_id": change.temporary_stop_id,
+        "temporary_stop_name": temporary_stop.name if temporary_stop else change.selected_address,
+        "temporary_latitude": temporary_stop.latitude if temporary_stop else change.selected_latitude,
+        "temporary_longitude": temporary_stop.longitude if temporary_stop else change.selected_longitude,
+        "start_date": change.start_date,
+        "end_date": change.end_date,
+    }
+
+
+@app.delete("/student/temporary-stop-change")
+def cancel_temporary_stop_change(
+    db: Session = Depends(get_db),
+    current_student: dict = Depends(require_student),
+):
+    student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student profile not found")
+
+    expire_temporary_stop_changes(db, student.id)
+    change = (
+        db.query(TemporaryStopChange)
+        .filter(
+            TemporaryStopChange.student_id == student.id,
+            TemporaryStopChange.status.in_(["scheduled", "active"]),
+        )
+        .order_by(TemporaryStopChange.created_at.desc())
+        .first()
+    )
+
+    if not change:
+        raise HTTPException(status_code=404, detail="No active or scheduled temporary stop change found")
+
+    change.status = "cancelled"
+    _deactivate_custom_stop(db, change)
+    db.commit()
+
+    return {"success": True, "message": "Temporary stop change cancelled", "request_id": change.id}
 
 
 # ============================================================
@@ -1634,27 +2278,33 @@ def create_wait_request(
     if not student:
         raise HTTPException(status_code=404, detail="Student profile not found")
 
-    if student.bus_id is None:
-        raise HTTPException(status_code=400, detail="No bus assigned to this student")
+    # Resolve effective stop and bus (respecting temporary stop change and missed bus allotment)
+    stop, _ = get_effective_student_stop(db, student)
+    if not stop:
+        raise HTTPException(status_code=404, detail="Assigned stop not found")
 
-    if student.stop_id is None:
-        raise HTTPException(status_code=400, detail="No stop assigned to this student")
+    allotment = get_active_missed_bus_allotment(db, student.id)
+    target_bus_id = allotment.alternative_bus_id if allotment else student.bus_id
+    if not target_bus_id:
+        raise HTTPException(status_code=400, detail="No bus assigned to this student")
 
     if not student_is_travelling_today(db, student.id):
         raise HTTPException(status_code=400, detail="You marked yourself as not travelling today")
 
-    trip = get_active_trip_for_bus(db, student.bus_id)
+    trip = (
+        db.query(Trip)
+        .filter(Trip.id == allotment.alternative_trip_id, Trip.status == "active")
+        .first()
+        if (allotment and allotment.alternative_trip_id)
+        else get_active_trip_for_bus(db, target_bus_id)
+    )
     if not trip:
         raise HTTPException(status_code=400, detail="No active bus trip right now")
-
-    stop = db.query(Stop).filter(Stop.id == student.stop_id).first()
-    if not stop:
-        raise HTTPException(status_code=404, detail="Assigned stop not found")
 
     if has_passed_stop(db, trip, stop):
         raise HTTPException(status_code=400, detail="The bus has already passed your stop")
 
-    eta_minutes = get_eta_minutes_to_stop(db, student.bus_id, trip.id, stop)
+    eta_minutes = get_eta_minutes_to_stop(db, target_bus_id, trip.id, stop)
     if eta_minutes is None:
         raise HTTPException(status_code=400, detail="Live ETA is currently unavailable")
 
@@ -1717,7 +2367,7 @@ def create_wait_request(
     now = datetime.utcnow()
     wait_request = WaitRequest(
         student_id=student.id,
-        bus_id=student.bus_id,
+        bus_id=target_bus_id,
         trip_id=trip.id,
         stop_id=stop.id,
         minutes=data.minutes,
@@ -1729,7 +2379,7 @@ def create_wait_request(
     db.commit()
     db.refresh(wait_request)
 
-    bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
+    bus = db.query(Bus).filter(Bus.id == target_bus_id).first()
     driver = db.query(Driver).filter(Driver.id == bus.driver_id).first() if bus and bus.driver_id else None
 
     if driver:
@@ -1751,7 +2401,7 @@ def create_wait_request(
                 "wait_request_id": wait_request.id,
                 "action": "skip_only"
             },
-            related_bus_id=student.bus_id,
+            related_bus_id=target_bus_id,
             related_trip_id=trip.id,
             related_wait_request_id=wait_request.id
         )
@@ -1762,7 +2412,7 @@ def create_wait_request(
         "message": "Wait request created",
         "request_id": wait_request.id,
         "student_id": student.id,
-        "bus_id": student.bus_id,
+        "bus_id": target_bus_id,
         "trip_id": trip.id,
         "stop_id": stop.id,
         "minutes": wait_request.minutes,
@@ -2115,39 +2765,84 @@ def get_driver_route_stops(
     if bus.route_id is None:
         raise HTTPException(status_code=400, detail="No route assigned to this bus")
 
-    stops = db.query(Stop).filter(Stop.route_id == bus.route_id).order_by(Stop.stop_order.asc()).all()
-
-    # Query all students assigned to this driver's bus
     today = date.today()
-    students = db.query(Student).filter(Student.bus_id == bus.id).all()
-    student_ids = [s.id for s in students]
 
-    # Find students who marked 'not_travelling' for today
+    # 1. Fetch active route stops (excluding soft-deleted / inactive custom stops)
+    regular_stops = (
+        db.query(Stop)
+        .filter(Stop.route_id == bus.route_id, Stop.is_active == True)
+        .order_by(Stop.stop_order.asc())
+        .all()
+    )
+
+    # 2. Determine all students boarding this bus today:
+    # A) Regularly assigned students
+    regular_students = db.query(Student).filter(Student.bus_id == bus.id).all()
+    regular_student_ids = [s.id for s in regular_students]
+
+    # Check which regular students have allotted to another bus today
+    missed_other_ids = set()
+    if regular_student_ids:
+        missed_other_rows = (
+            db.query(MissedBusAllotment.student_id)
+            .filter(
+                MissedBusAllotment.student_id.in_(regular_student_ids),
+                MissedBusAllotment.original_bus_id == bus.id,
+                MissedBusAllotment.alternative_bus_id != bus.id,
+                MissedBusAllotment.status == "active",
+            )
+            .all()
+        )
+        missed_other_ids = {r[0] for r in missed_other_rows}
+
+    # B) Alternative students allotted to this bus today
+    allotted_to_this_bus = (
+        db.query(Student)
+        .join(MissedBusAllotment, MissedBusAllotment.student_id == Student.id)
+        .filter(
+            MissedBusAllotment.alternative_bus_id == bus.id,
+            MissedBusAllotment.status == "active",
+        )
+        .all()
+    )
+
+    # Combined active student passenger list for this bus
+    boarding_students = [s for s in regular_students if s.id not in missed_other_ids] + allotted_to_this_bus
+    boarding_student_ids = [s.id for s in boarding_students]
+
+    # 3. Find students who marked 'not_travelling' for today
     not_travelling_ids = set()
-    if student_ids:
+    if boarding_student_ids:
         not_travelling_rows = db.query(TravelStatus.student_id).filter(
-            TravelStatus.student_id.in_(student_ids),
+            TravelStatus.student_id.in_(boarding_student_ids),
             TravelStatus.date == today,
             TravelStatus.status == "not_travelling"
         ).all()
         not_travelling_ids = {row[0] for row in not_travelling_rows}
 
-    # Aggregate active students per stop and total for today
+    # 4. Count passengers per effective stop
     stop_student_counts = {}
     total_expected_today = 0
-    for s in students:
+    stops_by_id = {st.id: st for st in regular_stops}
+
+    for s in boarding_students:
         if s.id not in not_travelling_ids:
             total_expected_today += 1
-            if s.stop_id:
-                stop_student_counts[s.stop_id] = stop_student_counts.get(s.stop_id, 0) + 1
+            eff_stop, _ = get_effective_student_stop(db, s)
+            if eff_stop and eff_stop.is_active:
+                stop_student_counts[eff_stop.id] = stop_student_counts.get(eff_stop.id, 0) + 1
+                if eff_stop.id not in stops_by_id:
+                    stops_by_id[eff_stop.id] = eff_stop
+
+    stops_list = sorted(stops_by_id.values(), key=lambda s: s.stop_order)
 
     return {
         "bus_id": bus.id,
         "bus_number": bus.bus_number,
         "route_id": bus.route_id,
-        "total_stops": len(stops),
+        "total_stops": len(stops_list),
         "total_students_today": total_expected_today,
-        "total_assigned_students": len(students),
+        "total_assigned_students": len(regular_students),
         "college_location": {
             "latitude": COLLEGE_LAT,
             "longitude": COLLEGE_LNG,
@@ -2160,9 +2855,10 @@ def get_driver_route_stops(
                 "latitude": stop.latitude,
                 "longitude": stop.longitude,
                 "stop_order": stop.stop_order,
+                "is_custom": getattr(stop, "is_custom", False),
                 "student_count": stop_student_counts.get(stop.id, 0)
             }
-            for stop in stops
+            for stop in stops_list
         ]
     }
 @app.post("/student/travel-status")
@@ -2300,6 +2996,7 @@ def admin_driver_payload(driver: Driver, db: Session):
     route = db.query(Route).filter(Route.id == bus.route_id).first() if bus and bus.route_id else None
     active_trip = db.query(Trip).filter(Trip.driver_id == driver.id, Trip.status == "active").first()
     latest_loc = db.query(BusLocation).filter(BusLocation.bus_id == bus.id).order_by(BusLocation.timestamp.desc()).first() if bus else None
+    complaints_count = db.query(DriverComplaint).filter(DriverComplaint.driver_id == driver.id).count()
 
     return {
         "driver_id": driver.id,
@@ -2313,7 +3010,8 @@ def admin_driver_payload(driver: Driver, db: Session):
         "route_id": route.id if route else None,
         "route_name": route.name if route else None,
         "trip_status": "active" if active_trip else "idle",
-        "is_online": True if active_trip or latest_loc else False
+        "is_online": True if active_trip or latest_loc else False,
+        "complaints_count": complaints_count
     }
 
 
@@ -3035,6 +3733,77 @@ def admin_delete_stop(stop_id: int, db: Session = Depends(get_db), current_user:
     return {"message": f"Stop {stop_name} deleted successfully", "stop_id": stop_id}
 
 
+# ------------------------------------------------------------
+# 5b. DRIVER COMPLAINTS MANAGEMENT
+# ------------------------------------------------------------
+
+@app.get("/admin/complaints")
+def list_admin_complaints(
+    driver_id: int | None = None,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    query = db.query(DriverComplaint)
+    if driver_id is not None:
+        query = query.filter(DriverComplaint.driver_id == driver_id)
+
+    complaints = query.order_by(DriverComplaint.created_at.desc()).all()
+
+    # Calculate per-driver complaint counts for summary
+    all_complaints = db.query(DriverComplaint).all()
+    driver_totals = {}
+    for c in all_complaints:
+        driver_totals[c.driver_id] = driver_totals.get(c.driver_id, 0) + 1
+
+    payload_list = []
+    for c in complaints:
+        driver = db.query(Driver).filter(Driver.id == c.driver_id).first()
+        driver_user = db.query(User).filter(User.id == driver.user_id).first() if driver else None
+        student = db.query(Student).filter(Student.id == c.student_id).first()
+        student_user = db.query(User).filter(User.id == student.user_id).first() if student else None
+        bus = db.query(Bus).filter(Bus.id == c.bus_id).first()
+
+        verifications = db.query(ComplaintVerification).filter(ComplaintVerification.complaint_id == c.id).all()
+        yes_count = sum(1 for v in verifications if v.response == "yes")
+        no_count = sum(1 for v in verifications if v.response == "no")
+        total_votes = len(verifications)
+
+        is_corroborated = (
+            total_votes >= COMPLAINT_MIN_VOTES
+            and (yes_count / total_votes) >= COMPLAINT_MIN_YES_RATIO
+            if total_votes > 0 else False
+        )
+
+        payload_list.append({
+            "complaint_id": c.id,
+            "reason": c.reason,
+            "description": c.description,
+            "status": c.status,
+            "created_at": to_utc_iso(c.created_at),
+            "driver_id": c.driver_id,
+            "driver_name": driver_user.name if driver_user else f"Driver #{c.driver_id}",
+            "driver_code": driver.driver_code if driver else None,
+            "driver_total_complaints": driver_totals.get(c.driver_id, 0),
+            "bus_id": c.bus_id,
+            "bus_number": bus.bus_number if bus else None,
+            "student_id": c.student_id,
+            "student_name": student_user.name if student_user else f"Student #{c.student_id}",
+            "roll_number": student.roll_number if student else None,
+            "corroboration": {
+                "yes_count": yes_count,
+                "no_count": no_count,
+                "total_votes": total_votes,
+                "is_corroborated": is_corroborated
+            }
+        })
+
+    return {
+        "complaints": payload_list,
+        "total_complaints": len(all_complaints),
+        "driver_counts": driver_totals
+    }
+
+
 @app.post("/admin/routes/{route_id}/reorder-stops")
 def admin_reorder_route_stops(
     route_id: int,
@@ -3602,25 +4371,73 @@ def get_student_my_bus(
     if student.bus_id is None:
         raise HTTPException(status_code=404, detail="No bus assigned to this student")
 
-    bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
-    if not bus:
+    user = db.query(User).filter(User.id == student.user_id).first()
+    regular_bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
+
+    # Check if student has an active alternative bus allotment for this journey
+    active_allotment = get_active_missed_bus_allotment(db, student.id)
+    if active_allotment:
+        alt_bus = db.query(Bus).filter(Bus.id == active_allotment.alternative_bus_id).first()
+        if alt_bus:
+            alt_route = db.query(Route).filter(Route.id == alt_bus.route_id).first() if alt_bus.route_id else None
+            alt_driver = db.query(Driver).filter(Driver.id == alt_bus.driver_id).first() if alt_bus.driver_id else None
+            alt_driver_user = db.query(User).filter(User.id == alt_driver.user_id).first() if alt_driver else None
+            alt_active_trip = (
+                db.query(Trip)
+                .filter(Trip.bus_id == alt_bus.id, Trip.status == "active")
+                .order_by(Trip.started_at.desc())
+                .first()
+            )
+            alt_location = (
+                db.query(BusLocation)
+                .filter(BusLocation.bus_id == alt_bus.id)
+                .order_by(BusLocation.timestamp.desc())
+                .first()
+            )
+            return {
+                "student_id": student.id,
+                "student_name": user.name if user else None,
+                "roll_number": student.roll_number,
+                "bus_id": alt_bus.id,
+                "bus_number": alt_bus.bus_number,
+                "route_id": alt_bus.route_id,
+                "route_name": alt_route.name if alt_route else None,
+                "driver_name": alt_driver_user.name if alt_driver_user else None,
+                "driver_phone": alt_driver_user.phone if alt_driver_user else None,
+                "registration_number": alt_bus.registration_number,
+                "active_trip": alt_active_trip is not None,
+                "alternative_bus": True,
+                "allotment_id": active_allotment.id,
+                "original_bus_id": active_allotment.original_bus_id,
+                "original_bus_number": regular_bus.bus_number if regular_bus else None,
+                "location": (
+                    {
+                        "latitude": alt_location.latitude,
+                        "longitude": alt_location.longitude,
+                        "speed": alt_location.speed,
+                        "timestamp": to_utc_iso(alt_location.timestamp)
+                    }
+                    if alt_location else None
+                )
+            }
+
+    if not regular_bus:
         raise HTTPException(status_code=404, detail="Assigned bus not found")
 
-    user = db.query(User).filter(User.id == student.user_id).first()
-    route = db.query(Route).filter(Route.id == bus.route_id).first() if bus.route_id else None
-    driver = db.query(Driver).filter(Driver.id == bus.driver_id).first() if bus.driver_id else None
+    route = db.query(Route).filter(Route.id == regular_bus.route_id).first() if regular_bus.route_id else None
+    driver = db.query(Driver).filter(Driver.id == regular_bus.driver_id).first() if regular_bus.driver_id else None
     driver_user = db.query(User).filter(User.id == driver.user_id).first() if driver else None
 
     active_trip = (
         db.query(Trip)
-        .filter(Trip.bus_id == bus.id, Trip.status == "active")
+        .filter(Trip.bus_id == regular_bus.id, Trip.status == "active")
         .order_by(Trip.started_at.desc())
         .first()
     )
 
     location = (
         db.query(BusLocation)
-        .filter(BusLocation.bus_id == bus.id)
+        .filter(BusLocation.bus_id == regular_bus.id)
         .order_by(BusLocation.timestamp.desc())
         .first()
     )
@@ -3629,14 +4446,15 @@ def get_student_my_bus(
         "student_id": student.id,
         "student_name": user.name if user else None,
         "roll_number": student.roll_number,
-        "bus_id": bus.id,
-        "bus_number": bus.bus_number,
-        "route_id": bus.route_id,
+        "bus_id": regular_bus.id,
+        "bus_number": regular_bus.bus_number,
+        "route_id": regular_bus.route_id,
         "route_name": route.name if route else None,
         "driver_name": driver_user.name if driver_user else None,
         "driver_phone": driver_user.phone if driver_user else None,
-        "registration_number": bus.registration_number,
+        "registration_number": regular_bus.registration_number,
         "active_trip": active_trip is not None,
+        "alternative_bus": False,
         "location": (
             {
                 "latitude": location.latitude,

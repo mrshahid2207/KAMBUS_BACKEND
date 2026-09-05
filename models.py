@@ -8,7 +8,8 @@ from sqlalchemy import (
     DateTime,
     Date,
     ForeignKey,
-    Text
+    Text,
+    Boolean
 )
 
 from database import Base
@@ -74,6 +75,9 @@ class Stop(Base):
     latitude = Column(Float, nullable=False)
     longitude = Column(Float, nullable=False)
     stop_order = Column(Integer, nullable=False)
+    is_custom = Column(Boolean, default=False, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_by_student_id = Column(Integer, ForeignKey("students.id"), nullable=True)
 
     
 class BusLocation(Base):
@@ -248,12 +252,8 @@ class DeviceToken(Base):
     is_active = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-driver_code = Column(
-    String(20),
-    unique=True,
-    nullable=False,
-    index=True
-)
+
+
 class BusEntryLog(Base):
     __tablename__ = "bus_entry_logs"
 
@@ -410,3 +410,34 @@ class StudentOTP(Base):
     expires_at = Column(DateTime, nullable=False)
     is_used = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class MissedBusAllotment(Base):
+    __tablename__ = "missed_bus_allotments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("students.id"), nullable=False, index=True)
+    original_bus_id = Column(Integer, ForeignKey("buses.id"), nullable=False)
+    alternative_bus_id = Column(Integer, ForeignKey("buses.id"), nullable=False)
+    original_trip_id = Column(Integer, ForeignKey("trips.id"), nullable=True)
+    alternative_trip_id = Column(Integer, ForeignKey("trips.id"), nullable=True)
+    stop_id = Column(Integer, ForeignKey("stops.id"), nullable=False)
+    status = Column(String(20), default="active", nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=True)
+
+
+class TemporaryStopChange(Base):
+    __tablename__ = "temporary_stop_changes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("students.id"), nullable=False, index=True)
+    original_stop_id = Column(Integer, ForeignKey("stops.id"), nullable=False)
+    temporary_stop_id = Column(Integer, ForeignKey("stops.id"), nullable=False)
+    selected_latitude = Column(Float, nullable=False)
+    selected_longitude = Column(Float, nullable=False)
+    selected_address = Column(String(255), nullable=True)
+    start_date = Column(Date, nullable=False, index=True)
+    end_date = Column(Date, nullable=False, index=True)
+    status = Column(String(20), default="scheduled", nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

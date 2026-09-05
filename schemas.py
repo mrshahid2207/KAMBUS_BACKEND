@@ -1,3 +1,4 @@
+from datetime import date
 from pydantic import BaseModel
 class LoginRequest(BaseModel):
     identifier: str
@@ -209,3 +210,16 @@ class StudentResendOtpRequest(BaseModel):
 
 class StudentSelectStopRequest(BaseModel):
     stop_id: int
+
+
+class TemporaryStopChangeCreate(BaseModel):
+    latitude: float
+    longitude: float
+    address: str | None = None
+    start_date: date
+    end_date: date
+
+
+class MissedBusAllotmentRequest(BaseModel):
+    latitude: float | None = None
+    longitude: float | None = None
