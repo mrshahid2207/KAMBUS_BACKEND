@@ -1,7 +1,6 @@
 from datetime import datetime, date
 
 from sqlalchemy import (
-    Boolean,
     Column,
     Integer,
     String,
@@ -76,12 +75,7 @@ class Stop(Base):
     longitude = Column(Float, nullable=False)
     stop_order = Column(Integer, nullable=False)
 
-    # Temporary map-selected stop support
-    is_custom = Column(Boolean, nullable=False, default=False, server_default="false")
-    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
-    created_by_student_id = Column(Integer, ForeignKey("students.id"), nullable=True)
-
-
+    
 class BusLocation(Base):
     __tablename__ = "bus_locations"
 
@@ -254,6 +248,12 @@ class DeviceToken(Base):
     is_active = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+driver_code = Column(
+    String(20),
+    unique=True,
+    nullable=False,
+    index=True
+)
 class BusEntryLog(Base):
     __tablename__ = "bus_entry_logs"
 
@@ -437,8 +437,3 @@ class TemporaryStopChange(Base):
     end_date = Column(Date, nullable=False, index=True)
     status = Column(String(20), default="scheduled", nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-    # Immutable audit copy of the exact location selected on the map
-    selected_latitude = Column(Float, nullable=True)
-    selected_longitude = Column(Float, nullable=True)
-    selected_address = Column(String(255), nullable=True)
