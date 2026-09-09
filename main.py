@@ -75,6 +75,8 @@ from schemas import (
     StudentResendOtpRequest,
     StudentSelectStopRequest,
     TemporaryStopChangeCreate,
+    TemporaryStopCheckRequest,
+    AdminTemporaryStopActionRequest,
     MissedBusAllotmentRequest
 )
 from email_service import generate_otp_code, send_student_verification_email
@@ -294,6 +296,21 @@ def initialize_trip_database():
             if "selected_address" not in temp_cols:
                 try:
                     connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN selected_address VARCHAR(255)"))
+                except Exception:
+                    pass
+            if "target_bus_id" not in temp_cols:
+                try:
+                    connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN target_bus_id INTEGER REFERENCES buses(id)"))
+                except Exception:
+                    pass
+            if "is_approximate_match" not in temp_cols:
+                try:
+                    connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN is_approximate_match BOOLEAN"))
+                except Exception:
+                    pass
+            if "match_distance_m" not in temp_cols:
+                try:
+                    connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN match_distance_m FLOAT"))
                 except Exception:
                     pass
 
@@ -1676,12 +1693,141 @@ def get_student_route_stops(
         ]
     }
 
-
 # ============================================================
 # AUTOMATIC STUDENT BUS / STOP FEATURES & HELPERS
 # ============================================================
 
 MAX_TEMP_STOP_DISTANCE_KM = 1.5
+
+# Tolerance for arbitrary-point-to-route-polyline distance checking.
+ROUTE_MATCH_TOLERANCE_M = 150.0
+
+# In-memory cache for OSRM route polylines: {route_id: (timestamp, points)}
+_POLYLINE_CACHE: dict[int, tuple[float, list[tuple[float, float]]]] = {}
+_POLYLINE_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
+def point_to_segment_distance_m(
+    p_lat: float, p_lon: float,
+    a_lat: float, a_lon: float,
+    b_lat: float, b_lon: float,
+) -> float:
+    """
+    Return the shortest distance in **meters** from point P to the line
+    segment A→B, using a spherical-projection approximation that is
+    accurate to better than 0.5 % for segments shorter than ~20 km.
+
+    Strategy
+    --------
+    1. Project all three points onto a local flat plane (equirectangular)
+       centred on A, in metres.
+    2. Find the closest point on the segment in that plane (standard 2-D
+       clamped-projection formula).
+    3. Convert the 2-D Euclidean distance back to metres (no further
+       spherical correction needed because the plane is already in metres).
+    """
+    import math as _math
+
+    # metres per degree at the midpoint latitude
+    mid_lat = (a_lat + b_lat) / 2.0
+    m_per_lat = 111_320.0                              # ~constant
+    m_per_lon = 111_320.0 * _math.cos(_math.radians(mid_lat))
+
+    # Project to local Cartesian (metres relative to A)
+    ax, ay = 0.0, 0.0
+    bx = (b_lon - a_lon) * m_per_lon
+    by = (b_lat - a_lat) * m_per_lat
+    px = (p_lon - a_lon) * m_per_lon
+    py = (p_lat - a_lat) * m_per_lat
+
+    # Squared length of segment AB
+    ab_sq = bx * bx + by * by
+    if ab_sq == 0.0:
+        # Degenerate segment (A == B)
+        return _math.hypot(px - ax, py - ay)
+
+    # Parameter t of the closest point on the infinite line; clamp to [0, 1]
+    t = max(0.0, min(1.0, ((px - ax) * bx + (py - ay) * by) / ab_sq))
+
+    # Closest point on segment
+    cx = ax + t * bx
+    cy = ay + t * by
+
+    return _math.hypot(px - cx, py - cy)
+
+
+def min_distance_to_route_m(
+    p_lat: float, p_lon: float,
+    polyline: list[tuple[float, float]],
+) -> float:
+    """
+    Minimum distance from point P to any segment of the given polyline.
+    Returns float('inf') if the polyline has fewer than 2 vertices.
+    """
+    if len(polyline) < 2:
+        return float("inf")
+    return min(
+        point_to_segment_distance_m(p_lat, p_lon, a[0], a[1], b[0], b[1])
+        for a, b in zip(polyline, polyline[1:])
+    )
+
+
+def get_route_polyline_points(
+    db: Session, route_id: int
+) -> list[tuple[float, float]]:
+    """
+    Return the driving geometry for *route_id* as an ordered list of
+    (lat, lon) tuples.
+
+    Priority
+    --------
+    1. In-memory cache (TTL = 5 min) to avoid hammering OSRM.
+    2. OSRM public routing API (``router.project-osrm.org``).
+    3. Graceful fallback: the ordered stop coordinates from the DB.
+    """
+    import time as _time
+
+    now = _time.monotonic()
+    cached = _POLYLINE_CACHE.get(route_id)
+    if cached and now - cached[0] < _POLYLINE_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    # Fetch ordered stops
+    stops = (
+        db.query(Stop)
+        .filter(Stop.route_id == route_id, Stop.is_active == True, Stop.is_custom == False)
+        .order_by(Stop.stop_order)
+        .all()
+    )
+    # Filter out stops without coordinates
+    valid_stops = [s for s in stops if s.latitude is not None and s.longitude is not None]
+    fallback = [(s.latitude, s.longitude) for s in valid_stops]
+
+    if len(valid_stops) < 2:
+        return fallback
+
+    # Build OSRM coordinate string: lon,lat;lon,lat;...
+    coord_str = ";".join(f"{s.longitude},{s.latitude}" for s in valid_stops)
+    osrm_url = (
+        f"https://router.project-osrm.org/route/v1/driving/{coord_str}"
+        f"?overview=full&geometries=geojson"
+    )
+
+    try:
+        req = urllib.request.Request(osrm_url, headers={"User-Agent": "KAMBUS-App/1.0"})
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            if resp.status == 200:
+                body = json.loads(resp.read().decode("utf-8"))
+                coords = body["routes"][0]["geometry"]["coordinates"]
+                # GeoJSON coords are [lon, lat]
+                points: list[tuple[float, float]] = [(c[1], c[0]) for c in coords]
+                _POLYLINE_CACHE[route_id] = (now, points)
+                return points
+    except Exception:
+        pass  # Fall through to stop-sequence fallback
+
+    _POLYLINE_CACHE[route_id] = (now, fallback)
+    return fallback
 
 
 def reverse_geocode(latitude: float, longitude: float) -> str | None:
@@ -1767,6 +1913,120 @@ def _deactivate_custom_stop(db: Session, change: TemporaryStopChange) -> None:
             stop.is_active = False
 
 
+def find_candidate_buses_for_location(
+    db: Session,
+    stop_id: int | None = None,
+    lat: float | None = None,
+    lng: float | None = None,
+    exclude_bus_id: int | None = None,
+) -> tuple[list[dict], bool, float | None]:
+    """
+    Find active candidate buses covering a given registered stop or lat/lng coordinates.
+    Returns (candidate_list, is_approximate_match, min_match_distance_m)
+    """
+    buses = db.query(Bus).filter(Bus.status == "active").all()
+    if not buses:
+        buses = db.query(Bus).all()
+
+    candidates = []
+    global_min_dist = float("inf")
+    is_approximate = lat is not None and lng is not None
+
+    for bus in buses:
+        if exclude_bus_id and bus.id == exclude_bus_id:
+            continue
+        if not bus.route_id:
+            continue
+
+        route = db.query(Route).filter(Route.id == bus.route_id).first()
+        if not route:
+            continue
+
+        match_dist = None
+        is_match = False
+
+        if stop_id is not None:
+            # A registered stop belongs to exactly one route, so containment is
+            # an exact route-id comparison rather than a geographic guess.
+            st = db.query(Stop).filter(Stop.id == stop_id).first()
+            if st and st.route_id == bus.route_id:
+                is_match = True
+                match_dist = 0.0
+        elif lat is not None and lng is not None:
+            polyline = get_route_polyline_points(db, bus.route_id)
+            dist_m = min_distance_to_route_m(lat, lng, polyline)
+            if dist_m <= ROUTE_MATCH_TOLERANCE_M:
+                is_match = True
+                match_dist = round(dist_m, 1)
+                if dist_m < global_min_dist:
+                    global_min_dist = dist_m
+
+        if is_match:
+            driver_name = None
+            driver_phone = None
+            if bus.driver_id:
+                driver = db.query(Driver).filter(Driver.id == bus.driver_id).first()
+                if driver and driver.user_id:
+                    d_user = db.query(User).filter(User.id == driver.user_id).first()
+                    if d_user:
+                        driver_name = d_user.name
+                        driver_phone = d_user.phone
+
+            eta_mins = None
+            live_distance_m = None
+            active_trip = get_active_trip_for_bus(db, bus.id)
+            target_stop = st if stop_id is not None else None
+            if lat is not None and lng is not None:
+                # get_eta_minutes_to_stop only needs latitude/longitude; this
+                # small object preserves the exact dropped point, not a nearby stop.
+                target_stop = type("RequestedPoint", (), {"latitude": lat, "longitude": lng})()
+            if active_trip and target_stop:
+                eta_mins = get_eta_minutes_to_stop(db, bus.id, active_trip.id, target_stop)
+                location = get_latest_location(db, bus.id, active_trip.id)
+                if location:
+                    live_distance_m = round(haversine_km(
+                        location.latitude, location.longitude,
+                        target_stop.latitude, target_stop.longitude,
+                    ) * 1000, 1)
+
+            # There is no capacity column in the Bus schema.  Occupancy can be
+            # reported from assigned students, but it is deliberately not used
+            # as a capacity estimate.
+            occupancy = db.query(Student).filter(Student.bus_id == bus.id).count()
+
+            candidates.append({
+                "bus_id": bus.id,
+                "bus_number": bus.bus_number,
+                "route_id": route.id,
+                "route_name": route.name,
+                "driver_name": driver_name or "Assigned Driver",
+                "driver_phone": driver_phone or "N/A",
+                "eta_minutes": eta_mins,
+                "distance_m": live_distance_m,
+                "occupancy": occupancy,
+                "capacity": None,
+                "match_distance_m": match_dist,
+                "is_approximate_match": lat is not None and lng is not None,
+                "match_description": (
+                    f"Bus {bus.bus_number} passes within {match_dist:.1f}m of this location"
+                    if lat is not None and lng is not None else "Registered stop on this route"
+                ),
+                "is_recommended": False,
+            })
+
+    candidates.sort(key=lambda c: (
+        c["eta_minutes"] if c["eta_minutes"] is not None else float("inf"),
+        c["distance_m"] if c["distance_m"] is not None else float("inf"),
+        c["bus_id"],
+    ))
+
+    if candidates:
+        candidates[0]["is_recommended"] = True
+
+    final_min_dist = global_min_dist if global_min_dist != float("inf") else None
+    return candidates, is_approximate, final_min_dist
+
+
 def expire_temporary_stop_changes(db: Session, student_id: int | None = None):
     today = date.today()
     query = db.query(TemporaryStopChange).filter(
@@ -1816,6 +2076,13 @@ def get_effective_student_stop(db: Session, student: Student):
         else None
     )
     return original_stop, None
+
+
+def get_effective_student_bus_id(student: Student, temp_change: TemporaryStopChange | None = None) -> int | None:
+    """Use an approved temporary target bus only for the change's effective window."""
+    if temp_change and temp_change.target_bus_id:
+        return temp_change.target_bus_id
+    return student.bus_id
 
 
 def get_active_missed_bus_allotment(db: Session, student_id: int):
@@ -1926,9 +2193,9 @@ def get_student_my_stop(
         raise HTTPException(status_code=404, detail="No stop assigned to this student")
 
     allotment = get_active_missed_bus_allotment(db, student.id)
-    target_bus_id = allotment.alternative_bus_id if allotment else student.bus_id
-    bus = db.query(Bus).filter(Bus.id == target_bus_id).first()
     stop, temp_change = get_effective_student_stop(db, student)
+    target_bus_id = allotment.alternative_bus_id if allotment else get_effective_student_bus_id(student, temp_change)
+    bus = db.query(Bus).filter(Bus.id == target_bus_id).first()
     if not bus or not stop:
         raise HTTPException(status_code=404, detail="Assigned stop or bus not found")
 
@@ -1992,7 +2259,7 @@ def automatically_allot_alternative_bus(
         }
 
     original_bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
-    stop, _ = get_effective_student_stop(db, student)
+    stop, temp_change = get_effective_student_stop(db, student)
     if not original_bus or not stop:
         raise HTTPException(status_code=404, detail="Current bus or stop could not be found")
 
@@ -2102,6 +2369,68 @@ def get_alternative_bus_allotment(
 # MAP-BASED TEMPORARY STOP ENDPOINTS
 # ============================================================
 
+def _validate_temporary_stop_input(data: TemporaryStopCheckRequest | TemporaryStopChangeCreate) -> None:
+    """Require exactly one temporary-stop input mode."""
+    has_stop = data.stop_id is not None
+    has_coordinates = data.latitude is not None or data.longitude is not None
+    if has_stop and has_coordinates:
+        raise HTTPException(status_code=400, detail="Provide either stop_id OR latitude/longitude, not both")
+    if not has_stop and (data.latitude is None or data.longitude is None):
+        raise HTTPException(status_code=400, detail="Either stop_id OR latitude and longitude must be provided")
+
+
+def _normal_route_stops(db: Session, bus: Bus) -> list[Stop]:
+    return (db.query(Stop)
+            .filter(Stop.route_id == bus.route_id, Stop.is_active == True, Stop.is_custom == False)
+            .order_by(Stop.stop_order.asc()).all())
+
+
+@app.post("/student/temporary-stop-change/check-route")
+def check_temporary_stop_route(
+    data: TemporaryStopCheckRequest,
+    db: Session = Depends(get_db),
+    current_student: dict = Depends(require_student),
+):
+    """Preview exact/approximate matches without persisting or rerouting anything."""
+    _validate_temporary_stop_input(data)
+    student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student profile not found")
+    current_bus = db.query(Bus).filter(Bus.id == student.bus_id).first() if student.bus_id else None
+    if not current_bus or not current_bus.route_id:
+        raise HTTPException(status_code=400, detail="Your assigned bus has no route")
+    route = db.query(Route).filter(Route.id == current_bus.route_id).first()
+    stops = _normal_route_stops(db, current_bus)
+    current_route = {"bus_id": current_bus.id, "bus_number": current_bus.bus_number,
+        "route_id": current_bus.route_id, "route_name": route.name if route else None,
+        "stops": [{"stop_id": s.id, "name": s.name, "latitude": s.latitude,
+                   "longitude": s.longitude, "stop_order": s.stop_order} for s in stops]}
+
+    match_distance_m = None
+    if data.stop_id is not None:
+        selected_stop = db.query(Stop).filter(Stop.id == data.stop_id).first()
+        if not selected_stop:
+            raise HTTPException(status_code=404, detail="Selected stop not found")
+        on_route = selected_stop.route_id == current_bus.route_id
+    else:
+        match_distance_m = min_distance_to_route_m(data.latitude, data.longitude,
+                                                    get_route_polyline_points(db, current_bus.route_id))
+        on_route = match_distance_m <= ROUTE_MATCH_TOLERANCE_M
+
+    if on_route:
+        return {"on_route": True, "message": "Selected stop is on your assigned bus route",
+                "current_route": current_route,
+                "match_distance_m": round(match_distance_m, 1) if match_distance_m is not None else 0.0,
+                "is_approximate_match": data.stop_id is None, "candidate_buses": []}
+
+    candidates, is_approximate, _ = find_candidate_buses_for_location(
+        db, data.stop_id, data.latitude, data.longitude, exclude_bus_id=current_bus.id)
+    return {"on_route": False,
+            "message": "Candidate buses found; admin approval is required" if candidates else "No bus is currently travelling through this route.",
+            "current_route": current_route,
+            "match_distance_m": round(match_distance_m, 1) if match_distance_m is not None else None,
+            "is_approximate_match": is_approximate, "candidate_buses": candidates}
+
 @app.post("/student/temporary-stop-change")
 def create_temporary_stop_change(
     data: TemporaryStopChangeCreate,
@@ -2116,6 +2445,9 @@ def create_temporary_stop_change(
             status_code=400,
             detail="A regular bus and stop must be assigned before using temporary stop change",
         )
+
+    _validate_temporary_stop_input(data)
+
     if data.start_date > data.end_date:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
     if (data.end_date - data.start_date).days > 30:
@@ -2127,20 +2459,12 @@ def create_temporary_stop_change(
         raise HTTPException(status_code=404, detail="Bus or stop not found")
     if original_bus.route_id is None:
         raise HTTPException(status_code=400, detail="Your assigned bus has no route")
-    if original_stop.route_id != original_bus.route_id:
-        raise HTTPException(status_code=409, detail="Your assigned stop does not belong to your bus route")
-
-    if not is_point_on_route(db, original_bus.route_id, data.latitude, data.longitude):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Selected location is too far from your route (must be within {MAX_TEMP_STOP_DISTANCE_KM} km of a stop on it)",
-        )
 
     overlapping = (
         db.query(TemporaryStopChange)
         .filter(
             TemporaryStopChange.student_id == student.id,
-            TemporaryStopChange.status.in_(["scheduled", "active"]),
+            TemporaryStopChange.status.in_(["scheduled", "active", "pending_admin_approval"]),
             TemporaryStopChange.start_date <= data.end_date,
             TemporaryStopChange.end_date >= data.start_date,
         )
@@ -2149,27 +2473,119 @@ def create_temporary_stop_change(
     if overlapping:
         raise HTTPException(status_code=409, detail="You already have an overlapping temporary stop change")
 
-    temporary_stop = get_or_create_custom_stop(
+    # Check if on-route or off-route
+    on_route = False
+    if data.stop_id is not None:
+        target_stop = db.query(Stop).filter(Stop.id == data.stop_id).first()
+        if not target_stop:
+            raise HTTPException(status_code=404, detail="Selected stop not found")
+        if target_stop.route_id == original_bus.route_id:
+            on_route = True
+    elif data.latitude is not None and data.longitude is not None:
+        polyline = get_route_polyline_points(db, original_bus.route_id)
+        dist_m = min_distance_to_route_m(data.latitude, data.longitude, polyline)
+        if dist_m <= ROUTE_MATCH_TOLERANCE_M:
+            on_route = True
+
+    if on_route:
+        if data.stop_id is not None:
+            temp_stop = db.query(Stop).filter(Stop.id == data.stop_id).first()
+        else:
+            temp_stop = get_or_create_custom_stop(
+                db,
+                route_id=original_bus.route_id,
+                latitude=data.latitude,
+                longitude=data.longitude,
+                address=data.address,
+                student_id=student.id,
+            )
+
+        status_val = "active" if data.start_date <= date.today() <= data.end_date else "scheduled"
+        change = TemporaryStopChange(
+            student_id=student.id,
+            original_stop_id=original_stop.id,
+            temporary_stop_id=temp_stop.id,
+            start_date=data.start_date,
+            end_date=data.end_date,
+            status=status_val,
+            created_at=datetime.utcnow(),
+            selected_latitude=data.latitude if data.latitude is not None else temp_stop.latitude,
+            selected_longitude=data.longitude if data.longitude is not None else temp_stop.longitude,
+            selected_address=temp_stop.name,
+            target_bus_id=original_bus.id,
+            is_approximate_match=False,
+            match_distance_m=0.0,
+        )
+        db.add(change)
+        db.commit()
+        db.refresh(change)
+
+        return {
+            "success": True,
+            "message": "Temporary stop change scheduled automatically",
+            "request_id": change.id,
+            "original_stop_id": original_stop.id,
+            "original_stop_name": original_stop.name,
+            "temporary_stop_id": temp_stop.id,
+            "temporary_stop_name": temp_stop.name,
+            "temporary_latitude": temp_stop.latitude,
+            "temporary_longitude": temp_stop.longitude,
+            "start_date": change.start_date,
+            "end_date": change.end_date,
+            "status": change.status,
+            "target_bus_id": original_bus.id,
+        }
+
+    # Off-route candidate bus search
+    candidates, is_approx, min_dist_m = find_candidate_buses_for_location(
         db,
-        route_id=original_bus.route_id,
-        latitude=data.latitude,
-        longitude=data.longitude,
-        address=data.address,
-        student_id=student.id,
+        stop_id=data.stop_id,
+        lat=data.latitude,
+        lng=data.longitude,
+        exclude_bus_id=original_bus.id,
     )
 
-    status_value = "active" if data.start_date <= date.today() <= data.end_date else "scheduled"
+    if not candidates:
+        raise HTTPException(
+            status_code=400,
+            detail="No bus is currently travelling through this route.",
+        )
+
+    chosen_bus_id = data.target_bus_id or candidates[0]["bus_id"]
+    chosen_candidate = next((candidate for candidate in candidates if candidate["bus_id"] == chosen_bus_id), None)
+    if not chosen_candidate:
+        raise HTTPException(status_code=400, detail="Selected bus does not cover the requested stop or location")
+
+    target_bus = db.query(Bus).filter(Bus.id == chosen_bus_id).first()
+    if not target_bus or not target_bus.route_id:
+        raise HTTPException(status_code=400, detail="Invalid target bus selected")
+
+    if data.stop_id is not None:
+        temp_stop = db.query(Stop).filter(Stop.id == data.stop_id).first()
+    else:
+        temp_stop = get_or_create_custom_stop(
+            db,
+            route_id=target_bus.route_id,
+            latitude=data.latitude,
+            longitude=data.longitude,
+            address=data.address,
+            student_id=student.id,
+        )
+
     change = TemporaryStopChange(
         student_id=student.id,
         original_stop_id=original_stop.id,
-        temporary_stop_id=temporary_stop.id,
+        temporary_stop_id=temp_stop.id,
         start_date=data.start_date,
         end_date=data.end_date,
-        status=status_value,
+        status="pending_admin_approval",
         created_at=datetime.utcnow(),
-        selected_latitude=data.latitude,
-        selected_longitude=data.longitude,
-        selected_address=temporary_stop.name,
+        selected_latitude=data.latitude if data.latitude is not None else temp_stop.latitude,
+        selected_longitude=data.longitude if data.longitude is not None else temp_stop.longitude,
+        selected_address=temp_stop.name,
+        target_bus_id=target_bus.id,
+        is_approximate_match=chosen_candidate["is_approximate_match"],
+        match_distance_m=chosen_candidate["match_distance_m"],
     )
     db.add(change)
     db.commit()
@@ -2177,17 +2593,19 @@ def create_temporary_stop_change(
 
     return {
         "success": True,
-        "message": "Temporary stop change scheduled automatically",
+        "message": "Temporary stop change request submitted and pending admin approval",
         "request_id": change.id,
         "original_stop_id": original_stop.id,
         "original_stop_name": original_stop.name,
-        "temporary_stop_id": temporary_stop.id,
-        "temporary_stop_name": temporary_stop.name,
-        "temporary_latitude": temporary_stop.latitude,
-        "temporary_longitude": temporary_stop.longitude,
+        "temporary_stop_id": temp_stop.id,
+        "temporary_stop_name": temp_stop.name,
+        "temporary_latitude": temp_stop.latitude,
+        "temporary_longitude": temp_stop.longitude,
         "start_date": change.start_date,
         "end_date": change.end_date,
-        "status": change.status,
+        "status": "pending_admin_approval",
+        "target_bus_id": target_bus.id,
+        "target_bus_number": target_bus.bus_number,
     }
 
 
@@ -2209,16 +2627,19 @@ def get_temporary_stop_change(
     )
 
     if not change:
-        return {"active": False, "scheduled": False}
+        return {"active": False, "scheduled": False, "pending_approval": False}
 
     temporary_stop = db.query(Stop).filter(Stop.id == change.temporary_stop_id).first()
+    target_bus = db.query(Bus).filter(Bus.id == change.target_bus_id).first() if change.target_bus_id else None
     today = date.today()
     active = change.start_date <= today <= change.end_date and change.status in ("scheduled", "active")
     scheduled = change.start_date > today and change.status == "scheduled"
+    pending = change.status == "pending_admin_approval"
 
     return {
         "active": active,
         "scheduled": scheduled,
+        "pending_approval": pending,
         "request_id": change.id,
         "status": change.status,
         "original_stop_id": change.original_stop_id,
@@ -2226,6 +2647,8 @@ def get_temporary_stop_change(
         "temporary_stop_name": temporary_stop.name if temporary_stop else change.selected_address,
         "temporary_latitude": temporary_stop.latitude if temporary_stop else change.selected_latitude,
         "temporary_longitude": temporary_stop.longitude if temporary_stop else change.selected_longitude,
+        "target_bus_id": change.target_bus_id,
+        "target_bus_number": target_bus.bus_number if target_bus else None,
         "start_date": change.start_date,
         "end_date": change.end_date,
     }
@@ -2245,7 +2668,7 @@ def cancel_temporary_stop_change(
         db.query(TemporaryStopChange)
         .filter(
             TemporaryStopChange.student_id == student.id,
-            TemporaryStopChange.status.in_(["scheduled", "active"]),
+            TemporaryStopChange.status.in_(["scheduled", "active", "pending_admin_approval"]),
         )
         .order_by(TemporaryStopChange.created_at.desc())
         .first()
@@ -2259,6 +2682,92 @@ def cancel_temporary_stop_change(
     db.commit()
 
     return {"success": True, "message": "Temporary stop change cancelled", "request_id": change.id}
+
+
+@app.get("/admin/temporary-stop-requests")
+def get_admin_temporary_stop_requests(
+    status: str | None = None,
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(require_admin),
+):
+    query = db.query(TemporaryStopChange)
+    if status:
+        query = query.filter(TemporaryStopChange.status == status)
+    requests = query.order_by(TemporaryStopChange.created_at.desc()).all()
+
+    res = []
+    for r in requests:
+        student = db.query(Student).filter(Student.id == r.student_id).first()
+        student_user = db.query(User).filter(User.id == student.user_id).first() if student else None
+        orig_stop = db.query(Stop).filter(Stop.id == r.original_stop_id).first()
+        temp_stop = db.query(Stop).filter(Stop.id == r.temporary_stop_id).first()
+        target_bus = db.query(Bus).filter(Bus.id == r.target_bus_id).first() if r.target_bus_id else None
+
+        res.append({
+            "request_id": r.id,
+            "student_id": r.student_id,
+            "student_name": student_user.name if student_user else f"Student #{r.student_id}",
+            "student_roll_number": student.roll_number if student else None,
+            "original_stop_name": orig_stop.name if orig_stop else None,
+            "temporary_stop_name": temp_stop.name if temp_stop else r.selected_address,
+            "target_bus_id": r.target_bus_id,
+            "target_bus_number": target_bus.bus_number if target_bus else None,
+            "status": r.status,
+            "start_date": r.start_date,
+            "end_date": r.end_date,
+            "created_at": to_utc_iso(r.created_at),
+            "is_approximate_match": r.is_approximate_match,
+            "match_distance_m": r.match_distance_m,
+        })
+    return res
+
+
+@app.post("/admin/temporary-stop-requests/{change_id}/approve")
+def approve_temporary_stop_request(
+    change_id: int,
+    data: AdminTemporaryStopActionRequest = None,
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(require_admin),
+):
+    change = db.query(TemporaryStopChange).filter(TemporaryStopChange.id == change_id).first()
+    if not change:
+        raise HTTPException(status_code=404, detail="Temporary stop request not found")
+
+    today = date.today()
+    change.status = "active" if change.start_date <= today <= change.end_date else "scheduled"
+    db.commit()
+    db.refresh(change)
+
+    return {
+        "success": True,
+        "message": f"Temporary stop request approved (status: {change.status})",
+        "request_id": change.id,
+        "status": change.status,
+    }
+
+
+@app.post("/admin/temporary-stop-requests/{change_id}/reject")
+def reject_temporary_stop_request(
+    change_id: int,
+    data: AdminTemporaryStopActionRequest = None,
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(require_admin),
+):
+    change = db.query(TemporaryStopChange).filter(TemporaryStopChange.id == change_id).first()
+    if not change:
+        raise HTTPException(status_code=404, detail="Temporary stop request not found")
+
+    change.status = "rejected"
+    _deactivate_custom_stop(db, change)
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "Temporary stop request rejected",
+        "request_id": change.id,
+        "status": "rejected",
+    }
+
 
 
 # ============================================================
@@ -2279,12 +2788,12 @@ def create_wait_request(
         raise HTTPException(status_code=404, detail="Student profile not found")
 
     # Resolve effective stop and bus (respecting temporary stop change and missed bus allotment)
-    stop, _ = get_effective_student_stop(db, student)
+    stop, temp_change = get_effective_student_stop(db, student)
     if not stop:
         raise HTTPException(status_code=404, detail="Assigned stop not found")
 
     allotment = get_active_missed_bus_allotment(db, student.id)
-    target_bus_id = allotment.alternative_bus_id if allotment else student.bus_id
+    target_bus_id = allotment.alternative_bus_id if allotment else get_effective_student_bus_id(student, temp_change)
     if not target_bus_id:
         raise HTTPException(status_code=400, detail="No bus assigned to this student")
 

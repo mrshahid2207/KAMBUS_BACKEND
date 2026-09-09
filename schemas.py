@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from datetime import date
 class LoginRequest(BaseModel):
     identifier: str
@@ -213,18 +213,32 @@ class StudentSelectStopRequest(BaseModel):
 
 
 class TemporaryStopChangeCreate(BaseModel):
-    latitude: float = Field(..., ge=-90, le=90)
-    longitude: float = Field(..., ge=-180, le=180)
- 
+    # Either stop_id OR (latitude + longitude) must be provided — not both.
+    stop_id: int | None = None
+    latitude: float | None = Field(None, ge=-90, le=90, validation_alias=AliasChoices("latitude", "lat"))
+    longitude: float | None = Field(None, ge=-180, le=180, validation_alias=AliasChoices("longitude", "lng"))
+
     # Reverse-geocoded label the client resolved for this point
-    # (e.g. "MG Road, Warangal"). Optional — if omitted, the backend
-    # falls back to a generic label ("Custom Stop") rather than failing
-    # the request, since geocoding is a display nicety, not a
-    # correctness requirement.
+    # (e.g. "MG Road, Warangal"). Optional — falls back to "Custom Stop".
     address: str | None = Field(None, max_length=255)
- 
+
     start_date: date
     end_date: date
+
+    # When off-route, the student selects a candidate bus; that ID is sent here.
+    target_bus_id: int | None = None
+
+
+class TemporaryStopCheckRequest(BaseModel):
+    """Pre-flight check before scheduling — does not persist anything."""
+    stop_id: int | None = None
+    latitude: float | None = Field(None, ge=-90, le=90, validation_alias=AliasChoices("latitude", "lat"))
+    longitude: float | None = Field(None, ge=-180, le=180, validation_alias=AliasChoices("longitude", "lng"))
+    address: str | None = Field(None, max_length=255)
+
+
+class AdminTemporaryStopActionRequest(BaseModel):
+    notes: str | None = None
 
 
 class MissedBusAllotmentRequest(BaseModel):

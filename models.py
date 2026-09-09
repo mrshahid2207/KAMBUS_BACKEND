@@ -9,7 +9,7 @@ from sqlalchemy import (
     DateTime,
     Date,
     ForeignKey,
-    Text
+    Text,
 )
 
 from database import Base
@@ -46,6 +46,7 @@ class Driver(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     driver_code = Column(String(20), unique=True, nullable=False, index=True)
     license_number = Column(String(100))
+
 
 class Route(Base):
     __tablename__ = "routes"
@@ -93,6 +94,8 @@ class BusLocation(Base):
     longitude = Column(Float, nullable=False)
     speed = Column(Float, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
+
+
 class Trip(Base):
     __tablename__ = "trips"
 
@@ -148,6 +151,8 @@ class Trip(Base):
         default=0,
         nullable=False
     )
+
+
 class WaitRequest(Base):
     __tablename__ = "wait_requests"
 
@@ -220,6 +225,8 @@ class WaitRequest(Base):
         DateTime,
         nullable=True
     )
+
+
 class TravelStatus(Base):
     __tablename__ = "travel_status"
 
@@ -232,6 +239,7 @@ class TravelStatus(Base):
 
 class Notification(Base):
     __tablename__ = "notifications"
+
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     title = Column(String(160), nullable=False)
@@ -247,6 +255,7 @@ class Notification(Base):
 
 class DeviceToken(Base):
     __tablename__ = "device_tokens"
+
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     token = Column(String(512), unique=True, nullable=False)
@@ -254,6 +263,8 @@ class DeviceToken(Base):
     is_active = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class BusEntryLog(Base):
     __tablename__ = "bus_entry_logs"
 
@@ -286,6 +297,8 @@ class BusEntryLog(Base):
         Float,
         nullable=False
     )
+
+
 class DriverComplaint(Base):
     __tablename__ = "driver_complaints"
 
@@ -340,6 +353,8 @@ class DriverComplaint(Base):
         default=datetime.utcnow,
         nullable=False
     )
+
+
 class ComplaintVerification(Base):
     __tablename__ = "complaint_verifications"
 
@@ -411,6 +426,7 @@ class StudentOTP(Base):
     is_used = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
+
 class MissedBusAllotment(Base):
     __tablename__ = "missed_bus_allotments"
 
@@ -442,3 +458,8 @@ class TemporaryStopChange(Base):
     selected_latitude = Column(Float, nullable=True)
     selected_longitude = Column(Float, nullable=True)
     selected_address = Column(String(255), nullable=True)
+
+    # Multi-bus assignment & proximity matching details
+    target_bus_id = Column(Integer, ForeignKey("buses.id"), nullable=True)
+    is_approximate_match = Column(Boolean, default=False, nullable=True)
+    match_distance_m = Column(Float, nullable=True)
