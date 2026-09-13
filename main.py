@@ -1809,7 +1809,7 @@ def get_route_polyline_points(
     # Build OSRM coordinate string: lon,lat;lon,lat;...
     coord_str = ";".join(f"{s.longitude},{s.latitude}" for s in valid_stops)
     osrm_url = (
-        f"https://router.project-osrm.org/route/v1/driving/{coord_str}"
+        f"https://kambus-orsm.onrender.com/route/v1/driving/{coord_str}"
         f"?overview=full&geometries=geojson"
     )
 
@@ -5512,3 +5512,4 @@ def report_driver_emergency_sos(
         "bus_id": bus.id,
         "incident": incident
     }
+
