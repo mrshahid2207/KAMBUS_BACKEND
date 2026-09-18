@@ -40,19 +40,25 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60
 # =========================
 
 def create_access_token(
-    user_id: int,
-    role: str
+    user_id_or_data = None,
+    role: str | None = None
 ):
-
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=ACCESS_TOKEN_EXPIRE_MINUTES
     )
 
-    payload = {
-        "sub": str(user_id),
-        "role": role,
-        "exp": expire,
-    }
+    if isinstance(user_id_or_data, dict):
+        payload = dict(user_id_or_data)
+        if "exp" not in payload:
+            payload["exp"] = expire
+        if "user_id" in payload and "sub" not in payload:
+            payload["sub"] = str(payload["user_id"])
+    else:
+        payload = {
+            "sub": str(user_id_or_data),
+            "role": role,
+            "exp": expire,
+        }
 
     return jwt.encode(
         payload,
@@ -82,7 +88,7 @@ def get_current_user(
             algorithms=[ALGORITHM]
         )
 
-        user_id = payload.get("sub")
+        user_id = payload.get("sub") or payload.get("user_id")
         role = payload.get("role")
 
         if user_id is None or role is None:
@@ -92,7 +98,7 @@ def get_current_user(
             )
 
         return {
-            "user_id": int(user_id),
+            "user_id": int(user_id) if str(user_id).isdigit() else user_id,
             "role": role
         }
 
@@ -126,7 +132,7 @@ def require_admin(
     current_user: dict = Depends(get_current_user)
 ):
 
-    if current_user["role"] != "admin":
+    if current_user["role"] not in ("admin", "super_admin"):
 
         raise HTTPException(
             status_code=403,
@@ -134,6 +140,22 @@ def require_admin(
         )
 
     return current_user
+
+
+def require_super_admin(
+    current_user: dict = Depends(get_current_user)
+):
+
+    if current_user["role"] != "super_admin":
+
+        raise HTTPException(
+            status_code=403,
+            detail="Super-admin access required"
+        )
+
+    return current_user
+
+
 def require_student(
     current_user: dict = Depends(get_current_user)
 ):
@@ -143,4 +165,4 @@ def require_student(
             detail="Student access required"
         )
 
-    return current_user
+    return current_user

@@ -139,9 +139,15 @@ def setup_test_environment(db_session):
     # OSRM geometry for a previous fixture's route.
     _POLYLINE_CACHE.clear()
     # Clean up old test records if present
+    from models import ComplaintVerification, DriverComplaint
+    from main import MissedBusAllotment
+    db_session.query(ComplaintVerification).delete()
+    db_session.query(DriverComplaint).delete()
+    db_session.query(MissedBusAllotment).delete()
     db_session.query(TemporaryStopChange).filter(TemporaryStopChange.selected_address.like("%Test%")).delete()
     db_session.query(Student).filter(Student.roll_number.like("TEST%")).delete()
     db_session.query(Bus).filter(Bus.bus_number.like("TEST%")).delete()
+    db_session.query(Driver).filter(Driver.driver_code.like("TEST%")).delete()
     db_session.query(Stop).filter(Stop.name.like("TEST%")).delete()
     db_session.query(Route).filter(Route.name.like("TEST%")).delete()
     db_session.query(User).filter(User.email.like("test_%@kambus.test")).delete()
@@ -149,8 +155,16 @@ def setup_test_environment(db_session):
 
     # Create Users
     u_student = User(name="Test Student 1", email="test_student1@kambus.test", phone="9999900001", password_hash=hash_password("pass123"), role="student", is_verified=True)
+    u_student2 = User(name="Test Student 2", email="test_student2@kambus.test", phone="9999900004", password_hash=hash_password("pass123"), role="student", is_verified=True)
+    u_driver = User(name="Test Driver 1", email="test_driver1@kambus.test", phone="9999900003", password_hash=hash_password("pass123"), role="driver", is_verified=True)
     u_admin = User(name="Test Admin", email="test_admin@kambus.test", phone="9999900002", password_hash=hash_password("pass123"), role="admin", is_verified=True)
-    db_session.add_all([u_student, u_admin])
+    u_super_admin = User(name="Test Super Admin", email="test_super_admin@kambus.test", phone="9999900005", password_hash=hash_password("pass123"), role="super_admin", is_verified=True)
+    db_session.add_all([u_student, u_student2, u_driver, u_admin, u_super_admin])
+    db_session.commit()
+
+    # Create Driver
+    driver1 = Driver(user_id=u_driver.id, driver_code="TEST_DRV_1", license_number="LIC123")
+    db_session.add(driver1)
     db_session.commit()
 
     # Create Routes
@@ -174,7 +188,7 @@ def setup_test_environment(db_session):
     db_session.commit()
 
     # Create Buses
-    bus1 = Bus(bus_number="TEST Bus 101", route_id=r1.id, status="active")
+    bus1 = Bus(bus_number="TEST Bus 101", route_id=r1.id, driver_id=driver1.id, status="active")
     bus2 = Bus(bus_number="TEST Bus 102", route_id=r2.id, status="active")
     bus3 = Bus(bus_number="TEST Bus 103", route_id=r3.id, status="active")
     bus4 = Bus(bus_number="TEST Bus 104", route_id=r4.id, status="active")
@@ -183,33 +197,54 @@ def setup_test_environment(db_session):
 
     # Create Student
     student1 = Student(user_id=u_student.id, roll_number="TEST_ROLL_101", department="CSE", bus_id=bus1.id, stop_id=stop_a1.id)
-    db_session.add(student1)
+    student2 = Student(user_id=u_student2.id, roll_number="TEST_ROLL_102", department="ECE", bus_id=bus2.id, stop_id=stop_b1.id)
+    db_session.add_all([student1, student2])
     db_session.commit()
 
     # Tokens
     t_student = create_access_token(u_student.id, "student")
+    t_student2 = create_access_token(u_student2.id, "student")
+    t_driver = create_access_token(u_driver.id, "driver")
     t_admin = create_access_token(u_admin.id, "admin")
+    t_super_admin = create_access_token(u_super_admin.id, "super_admin")
 
     yield {
         "user_student": u_student,
+        "user_student2": u_student2,
+        "user_driver": u_driver,
         "user_admin": u_admin,
+        "user_super_admin": u_super_admin,
         "student": student1,
+        "student2": student2,
+        "driver": driver1,
         "token_student": t_student,
+        "token_student2": t_student2,
+        "token_driver": t_driver,
         "token_admin": t_admin,
+        "token_super_admin": t_super_admin,
         "headers_student": {"Authorization": f"Bearer {t_student}"},
+        "headers_student2": {"Authorization": f"Bearer {t_student2}"},
+        "headers_driver": {"Authorization": f"Bearer {t_driver}"},
         "headers_admin": {"Authorization": f"Bearer {t_admin}"},
+        "headers_super_admin": {"Authorization": f"Bearer {t_super_admin}"},
         "bus1": bus1, "bus2": bus2, "bus3": bus3, "bus4": bus4,
         "stop_a1": stop_a1, "stop_a2": stop_a2,
         "stop_b1": stop_b1, "stop_b2": stop_b2, "stop_c1": stop_c1,
     }
 
     # Cleanup after test run
-    db_session.query(TemporaryStopChange).filter(TemporaryStopChange.student_id == student1.id).delete()
-    db_session.query(Student).filter(Student.id == student1.id).delete()
+    from models import ComplaintVerification, DriverComplaint
+    from main import MissedBusAllotment
+    db_session.query(ComplaintVerification).delete()
+    db_session.query(DriverComplaint).delete()
+    db_session.query(MissedBusAllotment).delete()
+    db_session.query(TemporaryStopChange).filter(TemporaryStopChange.student_id.in_([student1.id, student2.id])).delete()
+    db_session.query(Student).filter(Student.id.in_([student1.id, student2.id])).delete()
     db_session.query(Bus).filter(Bus.id.in_([bus1.id, bus2.id, bus3.id, bus4.id])).delete()
+    db_session.query(Driver).filter(Driver.id == driver1.id).delete()
     db_session.query(Stop).filter(Stop.id.in_([stop_a1.id, stop_a2.id, stop_b1.id, stop_b2.id, stop_c1.id, stop_c2.id, stop_d1.id, stop_d2.id])).delete()
     db_session.query(Route).filter(Route.id.in_([r1.id, r2.id, r3.id, r4.id])).delete()
-    db_session.query(User).filter(User.id.in_([u_student.id, u_admin.id])).delete()
+    db_session.query(User).filter(User.id.in_([u_student.id, u_student2.id, u_driver.id, u_admin.id, u_super_admin.id])).delete()
     db_session.commit()
 
 
@@ -340,7 +375,7 @@ def test_create_temp_stop_on_route_auto_scheduled(setup_test_environment):
     client.delete("/student/temporary-stop-change", headers=env["headers_student"])
 
 
-def test_create_temp_stop_off_route_pending_approval(setup_test_environment):
+def test_create_temp_stop_off_route_auto_approved(setup_test_environment):
     env = setup_test_environment
     today = date.today()
     resp = client.post(
@@ -356,7 +391,8 @@ def test_create_temp_stop_off_route_pending_approval(setup_test_environment):
     assert resp.status_code == 200
     data = resp.json()
     assert data["success"] is True
-    assert data["status"] == "pending_admin_approval"
+    # Auto-approval: Status is directly active/scheduled (no pending gate)
+    assert data["status"] in ("active", "scheduled")
     assert data["target_bus_id"] == env["bus2"].id
 
     # Clean up
@@ -422,10 +458,10 @@ def test_create_temp_stop_no_bus_matches_rejection(setup_test_environment):
 
 
 # =====================================================================
-# 4. ADMIN APPROVAL & EFFECTIVE STOP INTEGRATION TEST
+# 4. AUTO-APPROVAL & AUDIT LOG INTEGRATION TEST
 # =====================================================================
 
-def test_admin_approve_temporary_stop_request(setup_test_environment, db_session):
+def test_auto_approval_and_audit_log(setup_test_environment, db_session):
     env = setup_test_environment
     today = date.today()
 
@@ -442,20 +478,15 @@ def test_admin_approve_temporary_stop_request(setup_test_environment, db_session
     )
     assert sub_resp.status_code == 200
     req_id = sub_resp.json()["request_id"]
-    assert sub_resp.json()["status"] == "pending_admin_approval"
+    assert sub_resp.json()["status"] in ("active", "scheduled")
 
-    # Step 2: Admin lists pending requests
-    admin_list = client.get("/admin/temporary-stop-requests?status=pending_admin_approval", headers=env["headers_admin"])
+    # Step 2: Admin views audit logs
+    admin_list = client.get("/admin/temporary-stop-requests", headers=env["headers_admin"])
     assert admin_list.status_code == 200
     req_ids = [r["request_id"] for r in admin_list.json()]
     assert req_id in req_ids
 
-    # Step 3: Admin approves request
-    app_resp = client.post(f"/admin/temporary-stop-requests/{req_id}/approve", headers=env["headers_admin"])
-    assert app_resp.status_code == 200
-    assert app_resp.json()["status"] in ("active", "scheduled")
-
-    # Step 4: Verify student effective stop reflects approved change
+    # Step 3: Verify student effective stop immediately reflects change
     st_obj = db_session.query(Student).filter(Student.id == env["student"].id).first()
     eff_stop, eff_change = get_effective_student_stop(db_session, st_obj)
     assert eff_stop is not None
@@ -468,7 +499,122 @@ def test_admin_approve_temporary_stop_request(setup_test_environment, db_session
 
 
 # =====================================================================
-# 5. REGRESSION TEST FOR EXISTING FLOW
+# 5. BUS MISS REQUEST (REPLACEMENT BUS) INTEGRATION TEST
+# =====================================================================
+
+def test_missed_bus_allotment_matching_and_fallback(setup_test_environment, monkeypatch):
+    env = setup_test_environment
+    # Bus 101 assigned student misses bus -> alternative matching finds Bus 102
+    lat, lon = env["stop_a1"].latitude, env["stop_a1"].longitude
+    polylines = {
+        env["bus1"].route_id: [(17.980, 79.530), (17.980, 79.540)],
+        env["bus2"].route_id: [(17.980, 79.530), (17.980, 79.540)], # Same segment passes stop A1
+    }
+    monkeypatch.setattr("main.get_route_polyline_points", lambda _db, route_id: polylines.get(route_id, []))
+
+    # Successful Missed Bus Allotment
+    resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+    assert data["alternative_bus_id"] == env["bus2"].id
+
+    # Verify fallback when no alternative bus matches
+    monkeypatch.setattr("main.get_route_polyline_points", lambda _db, route_id: [])
+    fail_resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student2"])
+    assert fail_resp.status_code == 400
+    assert fail_resp.json()["detail"] == "No bus is currently travelling through this route."
+
+
+# =====================================================================
+# 6. DRIVER ROUTE STOPS PASSENGER COUNT WITH TRANSFERS
+# =====================================================================
+
+def test_driver_route_stops_pickup_counts(setup_test_environment):
+    env = setup_test_environment
+    today = date.today()
+
+    # Move Student 1 to Stop B1 on Bus 2
+    sub_resp = client.post(
+        "/student/temporary-stop-change",
+        json={
+            "stop_id": env["stop_b1"].id,
+            "target_bus_id": env["bus2"].id,
+            "start_date": str(today),
+            "end_date": str(today)
+        },
+        headers=env["headers_student"]
+    )
+    assert sub_resp.status_code == 200
+
+    # Driver 1 (Bus 1) route stops -> student 1 is transferred away, count at Stop A1 should not include student 1
+    resp_drv = client.get("/driver/route-stops", headers=env["headers_driver"])
+    assert resp_drv.status_code == 200
+    stops_data = resp_drv.json().get("stops", [])
+    stop_a1_entry = next((s for s in stops_data if s["stop_id"] == env["stop_a1"].id), None)
+    assert stop_a1_entry is not None
+    assert stop_a1_entry["student_count"] == 0
+
+    # Clean up
+    client.delete("/student/temporary-stop-change", headers=env["headers_student"])
+
+
+# =====================================================================
+# 7. SUPER-ADMIN COMPLAINT DETAIL RBAC & VOTER BREAKDOWN
+# =====================================================================
+
+def test_super_admin_complaint_detail_rbac(setup_test_environment, db_session):
+    env = setup_test_environment
+    from models import DriverComplaint, ComplaintVerification
+
+    # Create a complaint
+    complaint = DriverComplaint(
+        student_id=env["student"].id,
+        driver_id=env["driver"].id,
+        bus_id=env["bus1"].id,
+        reason="rash_driving",
+        description="Driver was overspeeding on the highway.",
+        status="pending"
+    )
+    db_session.add(complaint)
+    db_session.commit()
+
+    # Add a peer vote
+    vote = ComplaintVerification(
+        complaint_id=complaint.id,
+        student_id=env["student2"].id,
+        response="yes"
+    )
+    db_session.add(vote)
+    db_session.commit()
+
+    # Regular admin should be Forbidden (403)
+    reg_resp = client.get(f"/admin/complaints/{complaint.id}/detail", headers=env["headers_admin"])
+    assert reg_resp.status_code == 403
+
+    # Super admin should be Authorized (200) with full complainant identity & voter details
+    super_resp = client.get(f"/admin/complaints/{complaint.id}/detail", headers=env["headers_super_admin"])
+    assert super_resp.status_code == 200
+    data = super_resp.json()
+    assert data["complainant"]["roll_number"] == "TEST_ROLL_101"
+    assert data["complainant"]["email"] == "test_student1@kambus.test"
+    assert data["corroboration"]["yes_count"] == 1
+    assert len(data["voters"]) == 1
+    assert data["voters"][0]["roll_number"] == "TEST_ROLL_102"
+    assert data["voters"][0]["vote"] == "yes"
+
+    # Regular admin complaints list should mask complainant
+    list_resp = client.get("/admin/complaints", headers=env["headers_admin"])
+    assert list_resp.status_code == 200
+    complaints_list = list_resp.json().get("complaints", [])
+    comp_item = next((c for c in complaints_list if c["complaint_id"] == complaint.id), None)
+    assert comp_item is not None
+    assert comp_item["student_name"] == "Student (Anonymous)"
+    assert comp_item["roll_number"] is None
+
+
+# =====================================================================
+# 8. REGRESSION TEST FOR EXISTING FLOW
 # =====================================================================
 
 def test_regression_existing_temporary_stop_flow(setup_test_environment):
@@ -500,3 +646,4 @@ def test_regression_existing_temporary_stop_flow(setup_test_environment):
     del_resp = client.delete("/student/temporary-stop-change", headers=env["headers_student"])
     assert del_resp.status_code == 200
     assert del_resp.json()["success"] is True
+
