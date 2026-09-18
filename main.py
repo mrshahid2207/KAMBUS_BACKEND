@@ -1809,8 +1809,8 @@ def get_all_bus_routes(
 
 MAX_TEMP_STOP_DISTANCE_KM = 1.5
 
-# Tolerance for arbitrary-point-to-route-polyline distance checking (tightened to 20m for on-route corridor).
-ROUTE_MATCH_TOLERANCE_M = 20.0
+# Tolerance for arbitrary-point-to-route-polyline distance checking (30m for driver-phone GPS accuracy).
+ROUTE_MATCH_TOLERANCE_M = 30.0
 
 # In-memory cache for OSRM route polylines: {route_id: (timestamp, points)}
 _POLYLINE_CACHE: dict[int, tuple[float, list[tuple[float, float]]]] = {}
@@ -1882,17 +1882,64 @@ def min_distance_to_route_m(
     )
 
 
+def extend_polyline_endpoints(
+    points: list[tuple[float, float]],
+    ext_m: float = 150.0
+) -> list[tuple[float, float]]:
+    """
+    Extend the polyline endpoints backward from the first point and forward
+    from the last point along the road entry/exit tangents by `ext_m` meters.
+    Ensures that valid stops placed just before the first stop or just past
+    the last stop along the route corridor are smoothly matched.
+    """
+    if len(points) < 2:
+        return points
+
+    import math as _math
+    m_per_lat = 111_320.0
+
+    # Start extension (backward from points[0] away from points[1])
+    p0, p1 = points[0], points[1]
+    mid_lat = (p0[0] + p1[0]) / 2.0
+    m_per_lon = 111_320.0 * _math.cos(_math.radians(mid_lat))
+
+    dy = (p0[0] - p1[0]) * m_per_lat
+    dx = (p0[1] - p1[1]) * m_per_lon
+    dist = _math.hypot(dx, dy)
+
+    start_ext = p0
+    if dist > 0:
+        scale = ext_m / dist
+        start_ext = (p0[0] + (p0[0] - p1[0]) * scale, p0[1] + (p0[1] - p1[1]) * scale)
+
+    # End extension (forward from points[-1] away from points[-2])
+    pn_1, pn_2 = points[-1], points[-2]
+    mid_lat_end = (pn_1[0] + pn_2[0]) / 2.0
+    m_per_lon_end = 111_320.0 * _math.cos(_math.radians(mid_lat_end))
+
+    dy_end = (pn_1[0] - pn_2[0]) * m_per_lat
+    dx_end = (pn_1[1] - pn_2[1]) * m_per_lon_end
+    dist_end = _math.hypot(dx_end, dy_end)
+
+    end_ext = pn_1
+    if dist_end > 0:
+        scale_end = ext_m / dist_end
+        end_ext = (pn_1[0] + (pn_1[0] - pn_2[0]) * scale_end, pn_1[1] + (pn_1[1] - pn_2[1]) * scale_end)
+
+    return [start_ext] + list(points) + [end_ext]
+
+
 def get_route_polyline_points(
     db: Session, route_id: int
 ) -> list[tuple[float, float]]:
     """
     Return the driving geometry for *route_id* as an ordered list of
-    (lat, lon) tuples.
+    (lat, lon) tuples with full road curvature and terminal corridor extensions.
 
     Priority
     --------
     1. In-memory cache (TTL = 5 min) to avoid hammering OSRM.
-    2. OSRM public routing API (``router.project-osrm.org``).
+    2. OSRM public routing API (``router.project-osrm.org`` & ``kambus-orsm.onrender.com``).
     3. Graceful fallback: the ordered stop coordinates from the DB.
     """
     import time as _time
@@ -1913,31 +1960,48 @@ def get_route_polyline_points(
     valid_stops = [s for s in stops if s.latitude is not None and s.longitude is not None]
     fallback = [(s.latitude, s.longitude) for s in valid_stops]
 
-    if len(valid_stops) < 2:
-        return fallback
+    # Include College destination if not already present as the final stop
+    COLLEGE_LAT = 18.054145
+    COLLEGE_LNG = 79.535587
+    waypoints = list(valid_stops)
+    if valid_stops:
+        last_s = valid_stops[-1]
+        dist_to_college_km = haversine_km(last_s.latitude, last_s.longitude, COLLEGE_LAT, COLLEGE_LNG)
+        if dist_to_college_km > 0.1:  # More than 100m from college
+            college_wp = type("CollegeStop", (), {"latitude": COLLEGE_LAT, "longitude": COLLEGE_LNG})()
+            waypoints.append(college_wp)
+            fallback.append((COLLEGE_LAT, COLLEGE_LNG))
+
+    if len(waypoints) < 2:
+        extended_fallback = extend_polyline_endpoints(fallback)
+        return extended_fallback
 
     # Build OSRM coordinate string: lon,lat;lon,lat;...
-    coord_str = ";".join(f"{s.longitude},{s.latitude}" for s in valid_stops)
-    osrm_url = (
-        f"https://kambus-orsm.onrender.com/route/v1/driving/{coord_str}"
-        f"?overview=full&geometries=geojson"
-    )
+    coord_str = ";".join(f"{s.longitude},{s.latitude}" for s in waypoints)
+    osrm_urls = [
+        f"https://router.project-osrm.org/route/v1/driving/{coord_str}?overview=full&geometries=geojson&steps=false",
+        f"https://kambus-orsm.onrender.com/route/v1/driving/{coord_str}?overview=full&geometries=geojson",
+    ]
 
-    try:
-        req = urllib.request.Request(osrm_url, headers={"User-Agent": "KAMBUS-App/1.0"})
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
-            if resp.status == 200:
-                body = json.loads(resp.read().decode("utf-8"))
-                coords = body["routes"][0]["geometry"]["coordinates"]
-                # GeoJSON coords are [lon, lat]
-                points: list[tuple[float, float]] = [(c[1], c[0]) for c in coords]
-                _POLYLINE_CACHE[route_id] = (now, points)
-                return points
-    except Exception:
-        pass  # Fall through to stop-sequence fallback
+    for osrm_url in osrm_urls:
+        try:
+            req = urllib.request.Request(osrm_url, headers={"User-Agent": "KAMBUS-App/1.0"})
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                if resp.status == 200:
+                    body = json.loads(resp.read().decode("utf-8"))
+                    if body.get("routes") and len(body["routes"]) > 0:
+                        coords = body["routes"][0]["geometry"]["coordinates"]
+                        # GeoJSON coords are [lon, lat]
+                        points: list[tuple[float, float]] = [(c[1], c[0]) for c in coords]
+                        extended_points = extend_polyline_endpoints(points)
+                        _POLYLINE_CACHE[route_id] = (now, extended_points)
+                        return extended_points
+        except Exception:
+            continue
 
-    _POLYLINE_CACHE[route_id] = (now, fallback)
-    return fallback
+    extended_fallback = extend_polyline_endpoints(fallback)
+    _POLYLINE_CACHE[route_id] = (now, extended_fallback)
+    return extended_fallback
 
 
 def reverse_geocode(latitude: float, longitude: float) -> str | None:

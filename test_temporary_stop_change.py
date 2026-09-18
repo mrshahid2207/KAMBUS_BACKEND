@@ -60,50 +60,50 @@ def test_point_to_segment_distance_hand_computed():
 
 def test_route_match_tolerance_boundary_conditions():
     """
-    Explicit boundary condition testing for ROUTE_MATCH_TOLERANCE_M = 20.0m.
+    Explicit boundary condition testing for ROUTE_MATCH_TOLERANCE_M = 30.0m.
     
-    - 10.0m   --> matches (<= 20.0m)
-    - 20.00m  --> matches (explicitly testing exact boundary <= condition)
-    - 20.01m  --> does NOT match (> 20.0m)
-    - 30.0m   --> does NOT match (> 20.0m)
-    - 50.0m   --> does NOT match (> 20.0m)
+    - 15.0m   --> matches (<= 30.0m)
+    - 30.00m  --> matches (explicitly testing exact boundary <= condition)
+    - 30.01m  --> does NOT match (> 30.0m)
+    - 40.0m   --> does NOT match (> 30.0m)
+    - 50.0m   --> does NOT match (> 30.0m)
     """
-    assert ROUTE_MATCH_TOLERANCE_M == 20.0
+    assert ROUTE_MATCH_TOLERANCE_M == 30.0
 
     a_lat, a_lon = 17.98000, 79.53000
     b_lat, b_lon = 17.98000, 79.54000
     # midpoint longitude = 79.53500
 
     # 1 deg lat = 111,320 meters
-    delta_lat_10m = 10.0 / 111320.0
-    delta_lat_20m = 20.0 / 111320.0
-    delta_lat_20_01m = 20.01 / 111320.0
+    delta_lat_15m = 15.0 / 111320.0
     delta_lat_30m = 30.0 / 111320.0
+    delta_lat_30_01m = 30.01 / 111320.0
+    delta_lat_40m = 40.0 / 111320.0
     delta_lat_50m = 50.0 / 111320.0
 
-    # 10m offset (within 20m tolerance)
-    dist_10m = point_to_segment_distance_m(17.98000 + delta_lat_10m, 79.53500, a_lat, a_lon, b_lat, b_lon)
-    assert dist_10m <= ROUTE_MATCH_TOLERANCE_M, f"10m ({dist_10m:.2f}m) should match tolerance 20m"
+    # 15m offset (within 30m tolerance)
+    dist_15m = point_to_segment_distance_m(17.98000 + delta_lat_15m, 79.53500, a_lat, a_lon, b_lat, b_lon)
+    assert dist_15m <= ROUTE_MATCH_TOLERANCE_M, f"15m ({dist_15m:.2f}m) should match tolerance 30m"
 
-    # Exactly 20.0m offset
-    dist_20m = point_to_segment_distance_m(17.98000 + delta_lat_20m, 79.53500, a_lat, a_lon, b_lat, b_lon)
-    assert round(dist_20m, 4) <= ROUTE_MATCH_TOLERANCE_M, f"Exactly 20.0m ({dist_20m:.2f}m) must satisfy <= {ROUTE_MATCH_TOLERANCE_M}"
-
-    # 20.01m offset
-    dist_20_01m = point_to_segment_distance_m(17.98000 + delta_lat_20_01m, 79.53500, a_lat, a_lon, b_lat, b_lon)
-    assert dist_20_01m > ROUTE_MATCH_TOLERANCE_M, f"20.01m ({dist_20_01m:.2f}m) must exceed 20m tolerance"
-
-    # 30m offset
+    # Exactly 30.0m offset
     dist_30m = point_to_segment_distance_m(17.98000 + delta_lat_30m, 79.53500, a_lat, a_lon, b_lat, b_lon)
-    assert dist_30m > ROUTE_MATCH_TOLERANCE_M, f"30m ({dist_30m:.2f}m) must exceed 20m tolerance"
+    assert round(dist_30m, 4) <= ROUTE_MATCH_TOLERANCE_M, f"Exactly 30.0m ({dist_30m:.2f}m) must satisfy <= {ROUTE_MATCH_TOLERANCE_M}"
+
+    # 30.01m offset
+    dist_30_01m = point_to_segment_distance_m(17.98000 + delta_lat_30_01m, 79.53500, a_lat, a_lon, b_lat, b_lon)
+    assert dist_30_01m > ROUTE_MATCH_TOLERANCE_M, f"30.01m ({dist_30_01m:.2f}m) must exceed 30m tolerance"
+
+    # 40m offset
+    dist_40m = point_to_segment_distance_m(17.98000 + delta_lat_40m, 79.53500, a_lat, a_lon, b_lat, b_lon)
+    assert dist_40m > ROUTE_MATCH_TOLERANCE_M, f"40m ({dist_40m:.2f}m) must exceed 30m tolerance"
 
     # 50m offset
     dist_50m = point_to_segment_distance_m(17.98000 + delta_lat_50m, 79.53500, a_lat, a_lon, b_lat, b_lon)
-    assert dist_50m > ROUTE_MATCH_TOLERANCE_M, f"50m ({dist_50m:.2f}m) must exceed 20m tolerance"
+    assert dist_50m > ROUTE_MATCH_TOLERANCE_M, f"50m ({dist_50m:.2f}m) must exceed 30m tolerance"
 
 
 def test_min_distance_to_route_polyline():
-    """Test min_distance_to_route_m over multi-segment polyline with 20m tolerance."""
+    """Test min_distance_to_route_m over multi-segment polyline with 30m tolerance."""
     polyline = [
         (17.98000, 79.53000),
         (17.98000, 79.54000),
@@ -325,8 +325,8 @@ def test_check_route_arbitrary_point_another_bus(setup_test_environment, monkeyp
 
 def test_check_route_point_30m_to_50m_off_route_not_matched(setup_test_environment, monkeypatch):
     """
-    Points 30m - 50m off the route (e.g. adjacent parallel street or building setback)
-    must NOT be falsely matched under the tightened 20m tolerance.
+    Points beyond 30m off the route (e.g. adjacent parallel street or building setback)
+    must NOT be falsely matched under the 30m tolerance.
     """
     env = setup_test_environment
     polylines = {
@@ -337,12 +337,12 @@ def test_check_route_point_30m_to_50m_off_route_not_matched(setup_test_environme
     }
     monkeypatch.setattr("main.get_route_polyline_points", lambda _db, route_id: polylines.get(route_id, []))
 
-    # 40 meters off Stop A1: exceeds 20m tolerance, so should not match Bus 1 or any other bus
-    lat_40m_off = 17.98000 + (40.0 / 111320.0)
+    # 45 meters off Stop A1: exceeds 30m tolerance, so should not match Bus 1 or any other bus
+    lat_45m_off = 17.98000 + (45.0 / 111320.0)
     lon = 79.53000
     resp = client.post(
         "/student/temporary-stop-change/check-route",
-        json={"latitude": lat_40m_off, "longitude": lon},
+        json={"latitude": lat_45m_off, "longitude": lon},
         headers=env["headers_student"]
     )
     assert resp.status_code == 200
@@ -797,5 +797,72 @@ def test_student_all_bus_routes_reference_endpoint(setup_test_environment):
     # Verify anonymous access is forbidden
     unauth_resp = client.get("/student/all-bus-routes")
     assert unauth_resp.status_code in (401, 403)
+
+
+# =====================================================================
+# 10. ROUTE CONTINUITY: BEFORE FIRST STOP, AFTER LAST STOP & LONG STRETCHES
+# =====================================================================
+
+def test_route_matching_before_first_stop_and_after_last_stop():
+    """
+    Verify route matching for points along the road:
+    1. Just before the first stop (approach corridor) -> matches.
+    2. Just past the last stop (departure corridor) -> matches.
+    3. Far before/after route (e.g. 500m away) -> rejected.
+    4. Off to the side (perpendicular deviation > 30m) -> rejected.
+    """
+    from main import extend_polyline_endpoints, min_distance_to_route_m, ROUTE_MATCH_TOLERANCE_M
+
+    # Route segment along lat 17.98000 from lon 79.53000 to 79.54000 (~1.05 km)
+    base_poly = [(17.98000, 79.53000), (17.98000, 79.54000)]
+    extended_poly = extend_polyline_endpoints(base_poly, ext_m=150.0)
+
+    # 1. Point 40m before the first stop (lon 79.53000) along the road:
+    # 40m in lon = 40.0 / 105885.8 = ~0.0003777 deg lon
+    p_before_on_road = (17.98000, 79.53000 - 0.0003777)
+    dist_before = min_distance_to_route_m(p_before_on_road[0], p_before_on_road[1], extended_poly)
+    assert round(dist_before, 2) <= ROUTE_MATCH_TOLERANCE_M, f"Point 40m before first stop on road should match ({dist_before:.2f}m <= {ROUTE_MATCH_TOLERANCE_M}m)"
+
+    # 2. Point 40m past the last stop (lon 79.54000) along the road:
+    p_after_on_road = (17.98000, 79.54000 + 0.0003777)
+    dist_after = min_distance_to_route_m(p_after_on_road[0], p_after_on_road[1], extended_poly)
+    assert round(dist_after, 2) <= ROUTE_MATCH_TOLERANCE_M, f"Point 40m past last stop on road should match ({dist_after:.2f}m <= {ROUTE_MATCH_TOLERANCE_M}m)"
+
+    # 3. Point 500m before the first stop (far outside route corridor):
+    p_far = (17.98000, 79.53000 - (500.0 / 105885.8))
+    dist_far = min_distance_to_route_m(p_far[0], p_far[1], extended_poly)
+    assert round(dist_far, 2) > ROUTE_MATCH_TOLERANCE_M, f"Point 500m away must be rejected ({dist_far:.2f}m > {ROUTE_MATCH_TOLERANCE_M}m)"
+
+    # 4. Point 45m off to the side (perpendicular north of approach corridor):
+    p_off_side = (17.98000 + (45.0 / 111320.0), 79.53000 - 0.0003777)
+    dist_off_side = min_distance_to_route_m(p_off_side[0], p_off_side[1], extended_poly)
+    assert round(dist_off_side, 2) > ROUTE_MATCH_TOLERANCE_M, f"Point 45m off to the side must be rejected ({dist_off_side:.2f}m > {ROUTE_MATCH_TOLERANCE_M}m)"
+
+
+def test_route_matching_along_long_stretch_between_distant_stops():
+    """
+    Verify route matching throughout a long stretch between two distant stops.
+    Confirms matching works at multiple fractional positions (10%, 25%, 50%, 75%, 90%)
+    along the segment, not just near the stops or the midpoint.
+    """
+    from main import point_to_segment_distance_m, min_distance_to_route_m, ROUTE_MATCH_TOLERANCE_M
+
+    # 5 km long stretch between Stop 1 and Stop 2
+    a_lat, a_lon = 17.95000, 79.50000
+    b_lat, b_lon = 17.95000, 79.55000  # ~5.3 km east
+    polyline = [(a_lat, a_lon), (b_lat, b_lon)]
+
+    fractions = [0.10, 0.25, 0.50, 0.75, 0.90]
+    for frac in fractions:
+        # Point right on the road at `frac` of the distance
+        lon_on_road = a_lon + frac * (b_lon - a_lon)
+        dist_on = min_distance_to_route_m(a_lat, lon_on_road, polyline)
+        assert round(dist_on, 2) <= ROUTE_MATCH_TOLERANCE_M, f"Point at {int(frac*100)}% on road must match (got {dist_on:.2f}m)"
+
+        # Point 45m off to the side (perpendicular north) at `frac` of the distance
+        lat_off_road = a_lat + (45.0 / 111320.0)
+        dist_off = min_distance_to_route_m(lat_off_road, lon_on_road, polyline)
+        assert round(dist_off, 2) > ROUTE_MATCH_TOLERANCE_M, f"Point 45m off road at {int(frac*100)}% must be rejected (got {dist_off:.2f}m)"
+
 
 
