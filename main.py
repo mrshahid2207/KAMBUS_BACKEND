@@ -1461,7 +1461,20 @@ def get_bus_location(
 ):
     if current_user["role"] == "student":
         student = db.query(Student).filter(Student.user_id == current_user["user_id"]).first()
-        if not student or student.bus_id != bus_id:
+        if not student:
+            raise HTTPException(status_code=403, detail="Student profile not found")
+        active_allotment = get_active_missed_bus_allotment(db, student.id)
+        active_temp_change = get_active_temporary_stop_change(db, student.id)
+        effective_bus_id = (
+            active_allotment.alternative_bus_id
+            if active_allotment
+            else (
+                active_temp_change.target_bus_id
+                if (active_temp_change and active_temp_change.target_bus_id)
+                else student.bus_id
+            )
+        )
+        if effective_bus_id != bus_id:
             raise HTTPException(status_code=403, detail="You are not assigned to this bus")
 
     elif current_user["role"] == "driver":
@@ -1469,17 +1482,68 @@ def get_bus_location(
         if not driver or not db.query(Bus).filter(Bus.id == bus_id, Bus.driver_id == driver.id).first():
             raise HTTPException(status_code=403, detail="You are not assigned to this bus")
 
-    elif current_user["role"] != "admin":
+    elif current_user["role"] not in ("admin", "super_admin"):
         raise HTTPException(status_code=403, detail="Invalid role")
 
-    location = db.query(BusLocation).filter(BusLocation.bus_id == bus_id).order_by(BusLocation.timestamp.desc()).first()
+    active_trip = (
+        db.query(Trip)
+        .filter(Trip.bus_id == bus_id, Trip.status == "active")
+        .order_by(Trip.started_at.desc())
+        .first()
+    )
+
+    if not active_trip:
+        return {
+            "bus_id": bus_id,
+            "latitude": None,
+            "longitude": None,
+            "speed": None,
+            "timestamp": None,
+            "trip_id": None,
+            "trip_status": "inactive",
+            "is_active": False,
+            "active_trip": False,
+            "is_waiting": False,
+            "wait_remaining_seconds": None,
+            "wait_stop_id": None,
+            "wait_minutes": None
+        }
+
+    location = (
+        db.query(BusLocation)
+        .filter(BusLocation.bus_id == bus_id, BusLocation.trip_id == active_trip.id)
+        .order_by(BusLocation.timestamp.desc())
+        .first()
+    )
     if not location:
-        raise HTTPException(status_code=404, detail="No location found for this bus")
+        location = (
+            db.query(BusLocation)
+            .filter(BusLocation.bus_id == bus_id)
+            .order_by(BusLocation.timestamp.desc())
+            .first()
+        )
+
+    if not location:
+        return {
+            "bus_id": bus_id,
+            "latitude": None,
+            "longitude": None,
+            "speed": None,
+            "timestamp": None,
+            "trip_id": active_trip.id,
+            "trip_status": "active",
+            "is_active": True,
+            "active_trip": True,
+            "is_waiting": False,
+            "wait_remaining_seconds": None,
+            "wait_stop_id": None,
+            "wait_minutes": None
+        }
 
     active_wait = (
         db.query(WaitRequest)
         .filter(
-            WaitRequest.trip_id == location.trip_id,
+            WaitRequest.trip_id == active_trip.id,
             WaitRequest.bus_id == bus_id,
             WaitRequest.status == "accepted",
             WaitRequest.wait_until.isnot(None),
@@ -1487,8 +1551,6 @@ def get_bus_location(
         )
         .order_by(WaitRequest.wait_until.desc())
         .first()
-        if location.trip_id
-        else None
     )
 
     wait_remaining_seconds = None
@@ -1506,7 +1568,10 @@ def get_bus_location(
         "longitude": location.longitude,
         "speed": location.speed,
         "timestamp": to_utc_iso(location.timestamp),
-        "trip_id": location.trip_id,
+        "trip_id": active_trip.id,
+        "trip_status": "active",
+        "is_active": True,
+        "active_trip": True,
         "is_waiting": active_wait is not None,
         "wait_remaining_seconds": wait_remaining_seconds,
         "wait_stop_id": wait_stop_id,
@@ -1697,6 +1762,46 @@ def get_student_route_stops(
             for stop in stops
         ]
     }
+
+@app.get("/student/all-bus-routes")
+def get_all_bus_routes(
+    db: Session = Depends(get_db),
+    current_student: dict = Depends(require_student),
+):
+    """Read-only reference: every active bus with its route name and ordered stops."""
+    buses = db.query(Bus).filter(Bus.status == "active").order_by(Bus.bus_number.asc()).all()
+    if not buses:
+        buses = db.query(Bus).order_by(Bus.bus_number.asc()).all()
+
+    result = []
+    for bus in buses:
+        if not bus.route_id:
+            continue
+        route = db.query(Route).filter(Route.id == bus.route_id).first()
+        stops = (
+            db.query(Stop)
+            .filter(Stop.route_id == bus.route_id, Stop.is_active == True, Stop.is_custom == False)
+            .order_by(Stop.stop_order.asc())
+            .all()
+        )
+        result.append({
+            "bus_id": bus.id,
+            "bus_number": bus.bus_number,
+            "route_id": bus.route_id,
+            "route_name": route.name if route else None,
+            "stops": [
+                {
+                    "stop_id": s.id,
+                    "name": s.name,
+                    "latitude": s.latitude,
+                    "longitude": s.longitude,
+                    "stop_order": s.stop_order,
+                }
+                for s in stops
+            ],
+        })
+
+    return {"buses": result}
 
 # ============================================================
 # AUTOMATIC STUDENT BUS / STOP FEATURES & HELPERS
@@ -1924,10 +2029,20 @@ def find_candidate_buses_for_location(
     lat: float | None = None,
     lng: float | None = None,
     exclude_bus_id: int | None = None,
+    student_bus_id: int | None = None,
 ) -> tuple[list[dict], bool, float | None]:
     """
     Find active candidate buses covering a given registered stop or lat/lng coordinates.
     Returns (candidate_list, is_approximate_match, min_match_distance_m)
+
+    Parameters
+    ----------
+    exclude_bus_id : hard-exclude a bus (used by Missed Bus where the student's
+                     own bus is the one they missed — excluding it is correct).
+    student_bus_id : the student's currently-assigned bus (used by Temporary
+                     Stop Change). If this bus covers the stop it is included
+                     AND ranked first. When the student's own bus covers the
+                     stop, OTHER buses are excluded (no need to switch buses).
     """
     buses = db.query(Bus).filter(Bus.status == "active").all()
     if not buses:
@@ -2006,6 +2121,8 @@ def find_candidate_buses_for_location(
             # as a capacity estimate.
             occupancy = db.query(Student).filter(Student.bus_id == bus.id).count()
 
+            is_own = student_bus_id is not None and bus.id == student_bus_id
+
             candidates.append({
                 "bus_id": bus.id,
                 "bus_number": bus.bus_number,
@@ -2020,13 +2137,25 @@ def find_candidate_buses_for_location(
                 "match_distance_m": match_dist,
                 "is_approximate_match": lat is not None and lng is not None,
                 "match_description": (
-                    f"Bus {bus.bus_number} passes within {match_dist:.1f}m of this location"
-                    if lat is not None and lng is not None else "Registered stop on this route"
+                    "Your assigned bus already covers this location"
+                    if is_own else (
+                        f"Bus {bus.bus_number} passes within {match_dist:.1f}m of this location"
+                        if lat is not None and lng is not None else "Registered stop on this route"
+                    )
                 ),
                 "is_recommended": False,
+                "is_own_bus": is_own,
             })
 
+    # If the student's own bus covers the selected stop, keep ONLY their own
+    # bus — there is no reason to switch buses.
+    if student_bus_id is not None:
+        own_bus_candidates = [c for c in candidates if c.get("is_own_bus")]
+        if own_bus_candidates:
+            candidates = own_bus_candidates
+
     candidates.sort(key=lambda c: (
+        0 if c.get("is_own_bus") else 1,  # own bus always first
         c["eta_minutes"] if c["eta_minutes"] is not None else float("inf"),
         c["distance_m"] if c["distance_m"] is not None else float("inf"),
         c["bus_id"],
@@ -2406,9 +2535,18 @@ def check_temporary_stop_route(
                 "is_approximate_match": data.stop_id is None, "candidate_buses": []}
 
     candidates, is_approximate, _ = find_candidate_buses_for_location(
-        db, data.stop_id, data.latitude, data.longitude, exclude_bus_id=current_bus.id)
+        db, data.stop_id, data.latitude, data.longitude, student_bus_id=student.bus_id)
+
+    own_bus_found = any(c.get("is_own_bus") for c in candidates)
+    if own_bus_found:
+        msg = "Your assigned bus already covers this location"
+    elif candidates:
+        msg = "Candidate buses found; admin approval is required"
+    else:
+        msg = "No bus is currently travelling through this route."
+
     return {"on_route": False,
-            "message": "Candidate buses found; admin approval is required" if candidates else "No bus is currently travelling through this route.",
+            "message": msg,
             "current_route": current_route,
             "match_distance_m": round(match_distance_m, 1) if match_distance_m is not None else None,
             "is_approximate_match": is_approximate, "candidate_buses": candidates}
@@ -2524,7 +2662,7 @@ def create_temporary_stop_change(
         stop_id=data.stop_id,
         lat=data.latitude,
         lng=data.longitude,
-        exclude_bus_id=original_bus.id,
+        student_bus_id=original_bus.id,
     )
 
     if not candidates:
@@ -5036,12 +5174,21 @@ def get_student_my_bus(
                 .order_by(Trip.started_at.desc())
                 .first()
             )
-            alt_location = (
-                db.query(BusLocation)
-                .filter(BusLocation.bus_id == alt_bus.id)
-                .order_by(BusLocation.timestamp.desc())
-                .first()
-            )
+            alt_location = None
+            if alt_active_trip:
+                alt_location = (
+                    db.query(BusLocation)
+                    .filter(BusLocation.bus_id == alt_bus.id, BusLocation.trip_id == alt_active_trip.id)
+                    .order_by(BusLocation.timestamp.desc())
+                    .first()
+                )
+                if not alt_location:
+                    alt_location = (
+                        db.query(BusLocation)
+                        .filter(BusLocation.bus_id == alt_bus.id)
+                        .order_by(BusLocation.timestamp.desc())
+                        .first()
+                    )
             return {
                 "student_id": student.id,
                 "student_name": user.name if user else None,
@@ -5054,6 +5201,8 @@ def get_student_my_bus(
                 "driver_phone": alt_driver_user.phone if alt_driver_user else None,
                 "registration_number": alt_bus.registration_number,
                 "active_trip": alt_active_trip is not None,
+                "trip_status": "active" if alt_active_trip else "inactive",
+                "is_active": alt_active_trip is not None,
                 "alternative_bus": True,
                 "allotment_id": active_allotment.id if active_allotment else None,
                 "temporary_change_id": active_temp_change.id if active_temp_change else None,
@@ -5066,7 +5215,7 @@ def get_student_my_bus(
                         "speed": alt_location.speed,
                         "timestamp": to_utc_iso(alt_location.timestamp)
                     }
-                    if alt_location else None
+                    if (alt_active_trip and alt_location) else None
                 )
             }
 
@@ -5084,12 +5233,21 @@ def get_student_my_bus(
         .first()
     )
 
-    location = (
-        db.query(BusLocation)
-        .filter(BusLocation.bus_id == regular_bus.id)
-        .order_by(BusLocation.timestamp.desc())
-        .first()
-    )
+    location = None
+    if active_trip:
+        location = (
+            db.query(BusLocation)
+            .filter(BusLocation.bus_id == regular_bus.id, BusLocation.trip_id == active_trip.id)
+            .order_by(BusLocation.timestamp.desc())
+            .first()
+        )
+        if not location:
+            location = (
+                db.query(BusLocation)
+                .filter(BusLocation.bus_id == regular_bus.id)
+                .order_by(BusLocation.timestamp.desc())
+                .first()
+            )
 
     return {
         "student_id": student.id,
@@ -5103,6 +5261,8 @@ def get_student_my_bus(
         "driver_phone": driver_user.phone if driver_user else None,
         "registration_number": regular_bus.registration_number,
         "active_trip": active_trip is not None,
+        "trip_status": "active" if active_trip else "inactive",
+        "is_active": active_trip is not None,
         "alternative_bus": False,
         "location": (
             {
@@ -5111,7 +5271,7 @@ def get_student_my_bus(
                 "speed": location.speed,
                 "timestamp": to_utc_iso(location.timestamp)
             }
-            if location else None
+            if (active_trip and location) else None
         )
     }
 
@@ -5153,6 +5313,16 @@ def end_driver_trip(
             related_bus_id=trip.bus_id,
             related_trip_id=trip.id
         )
+        try:
+            notification_manager.push_notification_sync(student.user_id, {
+                "type": "trip_ended",
+                "title": "Trip Ended",
+                "message": f"{bus.bus_number if bus else 'Your bus'} has ended its trip.",
+                "trip_id": trip.id,
+                "bus_id": trip.bus_id
+            })
+        except Exception:
+            pass
 
     send_notification(
         db,
@@ -5164,6 +5334,15 @@ def end_driver_trip(
         related_bus_id=trip.bus_id,
         related_trip_id=trip.id
     )
+    try:
+        notification_manager.push_notification_sync(driver.user_id, {
+            "type": "trip_ended",
+            "title": "Trip Ended",
+            "message": "Your trip has ended.",
+            "trip_id": trip.id
+        })
+    except Exception:
+        pass
     db.commit()
 
     return {

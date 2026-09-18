@@ -647,3 +647,115 @@ def test_regression_existing_temporary_stop_flow(setup_test_environment):
     assert del_resp.status_code == 200
     assert del_resp.json()["success"] is True
 
+
+# =====================================================================
+# 9. OWN-BUS CANDIDATE PRIORITIZATION & ALL BUS ROUTES REFERENCE
+# =====================================================================
+
+def test_temporary_stop_own_bus_candidate_ranking_and_exclusion(setup_test_environment, db_session, monkeypatch):
+    """
+    BUG FIX VERIFICATION:
+    When a student's own bus already covers the selected stop/location within tolerance:
+    - Their own bus must be included AND ranked first (is_recommended: True, is_own_bus: True).
+    - Other candidate buses must be excluded (no need to switch to another bus).
+    - If the own bus does NOT cover the location, other candidate buses are returned.
+    """
+    from main import find_candidate_buses_for_location
+    env = setup_test_environment
+
+    bus1 = env["bus1"]  # Route 101: Stop A1 (17.98000, 79.53000), Stop A2 (17.98000, 79.54000)
+    bus2 = env["bus2"]  # Route 102: Stop B1 (17.95000, 79.50000), Stop B2 (17.95000, 79.51000)
+    bus3 = env["bus3"]  # Route 103: Stop C1 (17.95000, 79.50500), Stop C2 (17.95000, 79.51500)
+    bus4 = env["bus4"]  # Route 104: Stop D1 (17.95000, 79.50600), Stop D2 (17.95000, 79.51600)
+
+    polylines = {
+        bus1.route_id: [(17.980, 79.530), (17.980, 79.540)],
+        bus2.route_id: [(17.950, 79.500), (17.950, 79.510)],
+        bus3.route_id: [(17.950, 79.505), (17.950, 79.515)],
+        bus4.route_id: [(17.950, 79.506), (17.950, 79.516)],
+    }
+    monkeypatch.setattr("main.get_route_polyline_points", lambda _db, route_id: polylines[route_id])
+
+    # 1. Location near Stop B1/C1/D1 corridor:
+    # (17.95000, 79.50500) is within ~100m of routes for Bus 2, Bus 3, and Bus 4.
+    test_lat, test_lng = 17.95000, 79.50500
+
+    # Student 2 is assigned to Bus 2.
+    # When student_bus_id=bus2.id is supplied:
+    candidates, is_approx, _ = find_candidate_buses_for_location(
+        db_session,
+        lat=test_lat,
+        lng=test_lng,
+        student_bus_id=bus2.id
+    )
+
+    assert len(candidates) >= 1, "Must find at least one candidate"
+    assert candidates[0]["bus_id"] == bus2.id, "Student's own bus must be ranked first"
+    assert candidates[0]["is_recommended"] is True
+    assert candidates[0]["is_own_bus"] is True
+    # Other buses (bus3, bus4) must NOT be included since bus2 covers the location
+    candidate_bus_ids = [c["bus_id"] for c in candidates]
+    assert bus3.id not in candidate_bus_ids, "Other bus 3 should not appear when own bus covers location"
+    assert bus4.id not in candidate_bus_ids, "Other bus 4 should not appear when own bus covers location"
+
+    # 2. When student_bus_id is Bus 1 (Route 101, up at 17.98000), Bus 1 is far away (~3.3km).
+    # Bus 1 does NOT cover (17.95000, 79.50500).
+    candidates_other, _, _ = find_candidate_buses_for_location(
+        db_session,
+        lat=test_lat,
+        lng=test_lng,
+        student_bus_id=bus1.id
+    )
+    # Bus 1 should NOT be in candidates, and other buses (bus2, bus3, bus4) should be returned
+    cand_ids_other = [c["bus_id"] for c in candidates_other]
+    assert bus1.id not in cand_ids_other, "Bus 1 does not cover this location and should not appear"
+    assert len(candidates_other) >= 1, "Other matching buses should appear when own bus does not cover location"
+    assert any(c["bus_id"] in [bus2.id, bus3.id, bus4.id] for c in candidates_other)
+
+    # 3. Test check-route endpoint for Student 1 (assigned to Bus 1) checking a stop on Route 102:
+    check_resp = client.post(
+        "/student/temporary-stop-change/check-route",
+        json={"latitude": 17.95000, "longitude": 79.50500},
+        headers=env["headers_student"]  # Student 1 is on Bus 1
+    )
+    assert check_resp.status_code == 200
+    data = check_resp.json()
+    assert data["on_route"] is False
+    assert len(data["candidate_buses"]) >= 1
+    # Student 1's bus (Bus 1) does not cover here, so candidate buses from other routes appear
+    assert all(c["bus_id"] != bus1.id for c in data["candidate_buses"])
+
+
+def test_student_all_bus_routes_reference_endpoint(setup_test_environment):
+    """
+    FEATURE VERIFICATION:
+    GET /student/all-bus-routes:
+    - Accessible by student role.
+    - Returns all active buses with route names and ordered stops list.
+    - Contains read-only metadata (bus_id, bus_number, route_id, route_name, stops).
+    """
+    env = setup_test_environment
+
+    resp = client.get("/student/all-bus-routes", headers=env["headers_student"])
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "buses" in data
+    buses = data["buses"]
+    assert len(buses) >= 4, "Must list all configured test buses"
+
+    # Find Bus 101 entry
+    b1_entry = next((b for b in buses if b["bus_id"] == env["bus1"].id), None)
+    assert b1_entry is not None
+    assert b1_entry["bus_number"] == "TEST Bus 101"
+    assert b1_entry["route_name"] == "TEST Route 101"
+    assert len(b1_entry["stops"]) >= 2
+
+    # Check stops are ordered by stop_order
+    orders = [s["stop_order"] for s in b1_entry["stops"]]
+    assert orders == sorted(orders), "Stops must be sorted by stop_order"
+
+    # Verify anonymous access is forbidden
+    unauth_resp = client.get("/student/all-bus-routes")
+    assert unauth_resp.status_code in (401, 403)
+
+
