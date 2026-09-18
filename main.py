@@ -1809,8 +1809,8 @@ def get_all_bus_routes(
 
 MAX_TEMP_STOP_DISTANCE_KM = 1.5
 
-# Tolerance for arbitrary-point-to-route-polyline distance checking.
-ROUTE_MATCH_TOLERANCE_M = 150.0
+# Tolerance for arbitrary-point-to-route-polyline distance checking (tightened to 20m for on-route corridor).
+ROUTE_MATCH_TOLERANCE_M = 20.0
 
 # In-memory cache for OSRM route polylines: {route_id: (timestamp, points)}
 _POLYLINE_CACHE: dict[int, tuple[float, list[tuple[float, float]]]] = {}
@@ -2074,7 +2074,7 @@ def find_candidate_buses_for_location(
                 else:
                     polyline = get_route_polyline_points(db, bus.route_id)
                     dist_m = min_distance_to_route_m(st.latitude, st.longitude, polyline)
-                    if dist_m <= ROUTE_MATCH_TOLERANCE_M:
+                    if round(dist_m, 2) <= ROUTE_MATCH_TOLERANCE_M:
                         is_match = True
                         match_dist = round(dist_m, 1)
                         if dist_m < global_min_dist:
@@ -2082,7 +2082,7 @@ def find_candidate_buses_for_location(
         elif lat is not None and lng is not None:
             polyline = get_route_polyline_points(db, bus.route_id)
             dist_m = min_distance_to_route_m(lat, lng, polyline)
-            if dist_m <= ROUTE_MATCH_TOLERANCE_M:
+            if round(dist_m, 2) <= ROUTE_MATCH_TOLERANCE_M:
                 is_match = True
                 match_dist = round(dist_m, 1)
                 if dist_m < global_min_dist:
@@ -2526,7 +2526,7 @@ def check_temporary_stop_route(
     else:
         match_distance_m = min_distance_to_route_m(data.latitude, data.longitude,
                                                     get_route_polyline_points(db, current_bus.route_id))
-        on_route = match_distance_m <= ROUTE_MATCH_TOLERANCE_M
+        on_route = round(match_distance_m, 2) <= ROUTE_MATCH_TOLERANCE_M
 
     if on_route:
         return {"on_route": True, "message": "Selected stop is on your assigned bus route",
@@ -2604,7 +2604,7 @@ def create_temporary_stop_change(
     elif data.latitude is not None and data.longitude is not None:
         polyline = get_route_polyline_points(db, original_bus.route_id)
         dist_m = min_distance_to_route_m(data.latitude, data.longitude, polyline)
-        if dist_m <= ROUTE_MATCH_TOLERANCE_M:
+        if round(dist_m, 2) <= ROUTE_MATCH_TOLERANCE_M:
             on_route = True
 
     if on_route:

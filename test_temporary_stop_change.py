@@ -60,55 +60,59 @@ def test_point_to_segment_distance_hand_computed():
 
 def test_route_match_tolerance_boundary_conditions():
     """
-    Explicit boundary condition testing for ROUTE_MATCH_TOLERANCE_M = 150.0m.
+    Explicit boundary condition testing for ROUTE_MATCH_TOLERANCE_M = 20.0m.
     
-    - 50.0m   --> matches (<= 150.0m)
-    - 150.00m --> matches (explicitly testing exact boundary <= condition)
-    - 150.01m --> does NOT match (> 150.0m)
-    - 250.0m  --> does NOT match (> 150.0m)
+    - 10.0m   --> matches (<= 20.0m)
+    - 20.00m  --> matches (explicitly testing exact boundary <= condition)
+    - 20.01m  --> does NOT match (> 20.0m)
+    - 30.0m   --> does NOT match (> 20.0m)
+    - 50.0m   --> does NOT match (> 20.0m)
     """
-    assert ROUTE_MATCH_TOLERANCE_M == 150.0
+    assert ROUTE_MATCH_TOLERANCE_M == 20.0
 
     a_lat, a_lon = 17.98000, 79.53000
     b_lat, b_lon = 17.98000, 79.54000
     # midpoint longitude = 79.53500
 
     # 1 deg lat = 111,320 meters
+    delta_lat_10m = 10.0 / 111320.0
+    delta_lat_20m = 20.0 / 111320.0
+    delta_lat_20_01m = 20.01 / 111320.0
+    delta_lat_30m = 30.0 / 111320.0
     delta_lat_50m = 50.0 / 111320.0
-    delta_lat_150m = 150.0 / 111320.0
-    delta_lat_150_01m = 150.01 / 111320.0
-    delta_lat_250m = 250.0 / 111320.0
+
+    # 10m offset (within 20m tolerance)
+    dist_10m = point_to_segment_distance_m(17.98000 + delta_lat_10m, 79.53500, a_lat, a_lon, b_lat, b_lon)
+    assert dist_10m <= ROUTE_MATCH_TOLERANCE_M, f"10m ({dist_10m:.2f}m) should match tolerance 20m"
+
+    # Exactly 20.0m offset
+    dist_20m = point_to_segment_distance_m(17.98000 + delta_lat_20m, 79.53500, a_lat, a_lon, b_lat, b_lon)
+    assert round(dist_20m, 4) <= ROUTE_MATCH_TOLERANCE_M, f"Exactly 20.0m ({dist_20m:.2f}m) must satisfy <= {ROUTE_MATCH_TOLERANCE_M}"
+
+    # 20.01m offset
+    dist_20_01m = point_to_segment_distance_m(17.98000 + delta_lat_20_01m, 79.53500, a_lat, a_lon, b_lat, b_lon)
+    assert dist_20_01m > ROUTE_MATCH_TOLERANCE_M, f"20.01m ({dist_20_01m:.2f}m) must exceed 20m tolerance"
+
+    # 30m offset
+    dist_30m = point_to_segment_distance_m(17.98000 + delta_lat_30m, 79.53500, a_lat, a_lon, b_lat, b_lon)
+    assert dist_30m > ROUTE_MATCH_TOLERANCE_M, f"30m ({dist_30m:.2f}m) must exceed 20m tolerance"
 
     # 50m offset
     dist_50m = point_to_segment_distance_m(17.98000 + delta_lat_50m, 79.53500, a_lat, a_lon, b_lat, b_lon)
-    assert dist_50m <= ROUTE_MATCH_TOLERANCE_M, f"50m ({dist_50m:.2f}m) should match tolerance 150m"
-
-    # Exactly 150.0m offset
-    dist_150m = point_to_segment_distance_m(17.98000 + delta_lat_150m, 79.53500, a_lat, a_lon, b_lat, b_lon)
-    # Assert explicit <= behavior
-    assert dist_150m <= ROUTE_MATCH_TOLERANCE_M, f"Exactly 150.0m ({dist_150m:.2f}m) must satisfy <= {ROUTE_MATCH_TOLERANCE_M}"
-
-    # 150.01m offset
-    dist_150_01m = point_to_segment_distance_m(17.98000 + delta_lat_150_01m, 79.53500, a_lat, a_lon, b_lat, b_lon)
-    assert dist_150_01m > ROUTE_MATCH_TOLERANCE_M, f"150.01m ({dist_150_01m:.2f}m) must exceed 150m tolerance"
-
-    # 250m offset
-    dist_250m = point_to_segment_distance_m(17.98000 + delta_lat_250m, 79.53500, a_lat, a_lon, b_lat, b_lon)
-    assert dist_250m > ROUTE_MATCH_TOLERANCE_M, f"250m ({dist_250m:.2f}m) must exceed 150m tolerance"
+    assert dist_50m > ROUTE_MATCH_TOLERANCE_M, f"50m ({dist_50m:.2f}m) must exceed 20m tolerance"
 
 
 def test_min_distance_to_route_polyline():
-    """Test min_distance_to_route_m over multi-segment polyline."""
+    """Test min_distance_to_route_m over multi-segment polyline with 20m tolerance."""
     polyline = [
         (17.98000, 79.53000),
         (17.98000, 79.54000),
         (17.99000, 79.54000),
     ]
-    # Point near 2nd segment
-    p_lat, p_lon = 17.98500, 79.54050
+    # Point near 2nd segment, within ~10.5m: 10m / 105885m/deg = ~0.000095 deg lon
+    p_lat, p_lon = 17.98500, 79.54009
     dist_m = min_distance_to_route_m(p_lat, p_lon, polyline)
-    # 0.0005 deg lon at lat 17.985 is ~53 meters
-    assert dist_m < 60.0
+    assert dist_m < 15.0
     assert dist_m <= ROUTE_MATCH_TOLERANCE_M
 
 
@@ -282,8 +286,8 @@ def test_check_route_off_route_registered_stop(setup_test_environment):
 
 def test_check_route_arbitrary_point_current_route(setup_test_environment):
     env = setup_test_environment
-    # Point 50m off Stop A1 (17.98000, 79.53000)
-    lat = 17.98000 + (50.0 / 111320.0)
+    # Point within 10m of Stop A1 (17.98000, 79.53000)
+    lat = 17.98000 + (10.0 / 111320.0)
     lon = 79.53000
     resp = client.post(
         "/student/temporary-stop-change/check-route",
@@ -293,12 +297,19 @@ def test_check_route_arbitrary_point_current_route(setup_test_environment):
     assert resp.status_code == 200
     data = resp.json()
     assert data["on_route"] is True
+    assert data["candidate_buses"] == []
 
 
-def test_check_route_arbitrary_point_another_bus(setup_test_environment):
+def test_check_route_arbitrary_point_another_bus(setup_test_environment, monkeypatch):
     env = setup_test_environment
-    # Point 50m off Stop B1 (17.95000, 79.50000)
-    lat = 17.95000 + (50.0 / 111320.0)
+    polylines = {
+        env["bus1"].route_id: [(17.980, 79.530), (17.980, 79.540)],
+        env["bus2"].route_id: [(17.950, 79.500), (17.950, 79.510)],
+    }
+    monkeypatch.setattr("main.get_route_polyline_points", lambda _db, route_id: polylines.get(route_id, []))
+
+    # Point within 10m of Stop B1 (17.95000, 79.50000)
+    lat = 17.95000 + (10.0 / 111320.0)
     lon = 79.50000
     resp = client.post(
         "/student/temporary-stop-change/check-route",
@@ -310,6 +321,35 @@ def test_check_route_arbitrary_point_another_bus(setup_test_environment):
     assert data["on_route"] is False
     assert len(data["candidate_buses"]) >= 1
     assert data["candidate_buses"][0]["bus_id"] == env["bus2"].id
+
+
+def test_check_route_point_30m_to_50m_off_route_not_matched(setup_test_environment, monkeypatch):
+    """
+    Points 30m - 50m off the route (e.g. adjacent parallel street or building setback)
+    must NOT be falsely matched under the tightened 20m tolerance.
+    """
+    env = setup_test_environment
+    polylines = {
+        env["bus1"].route_id: [(17.980, 79.530), (17.980, 79.540)],
+        env["bus2"].route_id: [(17.950, 79.500), (17.950, 79.510)],
+        env["bus3"].route_id: [(17.950, 79.505), (17.950, 79.515)],
+        env["bus4"].route_id: [(17.950, 79.506), (17.950, 79.516)],
+    }
+    monkeypatch.setattr("main.get_route_polyline_points", lambda _db, route_id: polylines.get(route_id, []))
+
+    # 40 meters off Stop A1: exceeds 20m tolerance, so should not match Bus 1 or any other bus
+    lat_40m_off = 17.98000 + (40.0 / 111320.0)
+    lon = 79.53000
+    resp = client.post(
+        "/student/temporary-stop-change/check-route",
+        json={"latitude": lat_40m_off, "longitude": lon},
+        headers=env["headers_student"]
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["on_route"] is False
+    assert data["candidate_buses"] == []
+    assert data["message"] == "No bus is currently travelling through this route."
 
 
 def test_check_route_no_bus_matches(setup_test_environment):
@@ -677,8 +717,8 @@ def test_temporary_stop_own_bus_candidate_ranking_and_exclusion(setup_test_envir
     monkeypatch.setattr("main.get_route_polyline_points", lambda _db, route_id: polylines[route_id])
 
     # 1. Location near Stop B1/C1/D1 corridor:
-    # (17.95000, 79.50500) is within ~100m of routes for Bus 2, Bus 3, and Bus 4.
-    test_lat, test_lng = 17.95000, 79.50500
+    # (17.95000, 79.50800) is directly on routes for Bus 2, Bus 3, and Bus 4 (dist = 0m).
+    test_lat, test_lng = 17.95000, 79.50800
 
     # Student 2 is assigned to Bus 2.
     # When student_bus_id=bus2.id is supplied:
@@ -699,7 +739,7 @@ def test_temporary_stop_own_bus_candidate_ranking_and_exclusion(setup_test_envir
     assert bus4.id not in candidate_bus_ids, "Other bus 4 should not appear when own bus covers location"
 
     # 2. When student_bus_id is Bus 1 (Route 101, up at 17.98000), Bus 1 is far away (~3.3km).
-    # Bus 1 does NOT cover (17.95000, 79.50500).
+    # Bus 1 does NOT cover (17.95000, 79.50800).
     candidates_other, _, _ = find_candidate_buses_for_location(
         db_session,
         lat=test_lat,
@@ -715,7 +755,7 @@ def test_temporary_stop_own_bus_candidate_ranking_and_exclusion(setup_test_envir
     # 3. Test check-route endpoint for Student 1 (assigned to Bus 1) checking a stop on Route 102:
     check_resp = client.post(
         "/student/temporary-stop-change/check-route",
-        json={"latitude": 17.95000, "longitude": 79.50500},
+        json={"latitude": 17.95000, "longitude": 79.50800},
         headers=env["headers_student"]  # Student 1 is on Bus 1
     )
     assert check_resp.status_code == 200
