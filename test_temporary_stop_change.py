@@ -14,11 +14,13 @@ from main import (
     min_distance_to_route_m,
     is_point_on_route,
     get_effective_student_stop,
+    get_active_missed_bus_allotment,
     _POLYLINE_CACHE,
 )
 from database import SessionLocal, Base, engine
 from models import (
-    User, Student, Driver, Route, Bus, Stop, Trip, BusLocation, TemporaryStopChange
+    User, Student, Driver, Route, Bus, Stop, Trip, BusLocation, TemporaryStopChange,
+    MissedBusAllotment, Notification, TravelStatus
 )
 from auth import hash_password, create_access_token
 from fastapi.testclient import TestClient
@@ -144,7 +146,10 @@ def setup_test_environment(db_session):
     _POLYLINE_CACHE.clear()
     # Clean up old test records if present
     from models import ComplaintVerification, DriverComplaint
-    from main import MissedBusAllotment
+    db_session.query(BusLocation).delete()
+    db_session.query(Trip).delete()
+    db_session.query(Notification).delete()
+    db_session.query(TravelStatus).delete()
     db_session.query(ComplaintVerification).delete()
     db_session.query(DriverComplaint).delete()
     db_session.query(MissedBusAllotment).delete()
@@ -238,7 +243,10 @@ def setup_test_environment(db_session):
 
     # Cleanup after test run
     from models import ComplaintVerification, DriverComplaint
-    from main import MissedBusAllotment
+    db_session.query(BusLocation).delete()
+    db_session.query(Trip).delete()
+    db_session.query(Notification).delete()
+    db_session.query(TravelStatus).delete()
     db_session.query(ComplaintVerification).delete()
     db_session.query(DriverComplaint).delete()
     db_session.query(MissedBusAllotment).delete()
@@ -542,15 +550,50 @@ def test_auto_approval_and_audit_log(setup_test_environment, db_session):
 # 5. BUS MISS REQUEST (REPLACEMENT BUS) INTEGRATION TEST
 # =====================================================================
 
-def test_missed_bus_allotment_matching_and_fallback(setup_test_environment, monkeypatch):
-    env = setup_test_environment
-    # Bus 101 assigned student misses bus -> alternative matching finds Bus 102
-    lat, lon = env["stop_a1"].latitude, env["stop_a1"].longitude
+def _create_missed_bus_trips(db, env, passed=True, alternative_active=True, original_active=True):
+    original_trip = Trip(
+        bus_id=env["bus1"].id,
+        driver_id=env["driver"].id,
+        route_id=env["bus1"].route_id,
+        status="active" if original_active else "completed",
+        started_at=datetime.utcnow(),
+        ended_at=None if original_active else datetime.utcnow(),
+    )
+    alternative_trip = Trip(
+        bus_id=env["bus2"].id,
+        driver_id=env["driver"].id,
+        route_id=env["bus2"].route_id,
+        status="active" if alternative_active else "completed",
+        started_at=datetime.utcnow(),
+        ended_at=None if alternative_active else datetime.utcnow(),
+    )
+    db.add_all([original_trip, alternative_trip])
+    db.commit()
+    if original_active:
+        location_stop = env["stop_a2"] if passed else env["stop_a1"]
+        db.add(BusLocation(
+            bus_id=env["bus1"].id,
+            trip_id=original_trip.id,
+            latitude=location_stop.latitude,
+            longitude=location_stop.longitude,
+            speed=20,
+        ))
+        db.commit()
+    return original_trip, alternative_trip
+
+
+def _mock_missed_bus_routes(monkeypatch, env):
     polylines = {
         env["bus1"].route_id: [(17.980, 79.530), (17.980, 79.540)],
-        env["bus2"].route_id: [(17.980, 79.530), (17.980, 79.540)], # Same segment passes stop A1
+        env["bus2"].route_id: [(17.980, 79.530), (17.980, 79.540)],
     }
     monkeypatch.setattr("main.get_route_polyline_points", lambda _db, route_id: polylines.get(route_id, []))
+
+
+def test_missed_bus_allotment_matching_and_fallback(setup_test_environment, db_session, monkeypatch):
+    env = setup_test_environment
+    _mock_missed_bus_routes(monkeypatch, env)
+    _create_missed_bus_trips(db_session, env)
 
     # Successful Missed Bus Allotment
     resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
@@ -558,12 +601,121 @@ def test_missed_bus_allotment_matching_and_fallback(setup_test_environment, monk
     data = resp.json()
     assert data["success"] is True
     assert data["alternative_bus_id"] == env["bus2"].id
+    assert get_active_missed_bus_allotment(db_session, env["student"].id).status == "active"
 
     # Verify fallback when no alternative bus matches
+    alternative_trip = db_session.query(Trip).filter(Trip.bus_id == env["bus2"].id, Trip.status == "active").first()
+    db_session.add(BusLocation(bus_id=env["bus2"].id, trip_id=alternative_trip.id,
+                               latitude=env["stop_b2"].latitude, longitude=env["stop_b2"].longitude, speed=20))
+    db_session.commit()
     monkeypatch.setattr("main.get_route_polyline_points", lambda _db, route_id: [])
     fail_resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student2"])
     assert fail_resp.status_code == 400
     assert fail_resp.json()["detail"] == "No bus is currently travelling through this route."
+
+
+def test_missed_bus_rejects_when_original_bus_has_not_reached_stop(setup_test_environment, db_session, monkeypatch):
+    env = setup_test_environment
+    _mock_missed_bus_routes(monkeypatch, env)
+    _create_missed_bus_trips(db_session, env, passed=False)
+    response = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Your bus has not reached your stop yet."
+
+
+def test_missed_bus_rejects_without_original_trip_today(setup_test_environment):
+    env = setup_test_environment
+    response = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Your bus hasn't started yet."
+
+
+def test_missed_bus_rejects_ended_original_trip_today(setup_test_environment, db_session, monkeypatch):
+    env = setup_test_environment
+    _mock_missed_bus_routes(monkeypatch, env)
+    _create_missed_bus_trips(db_session, env, original_active=False)
+    response = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Your bus hasn't started yet."
+
+
+def test_missed_bus_rejects_candidate_without_active_trip(setup_test_environment, db_session, monkeypatch):
+    env = setup_test_environment
+    _mock_missed_bus_routes(monkeypatch, env)
+    _create_missed_bus_trips(db_session, env, alternative_active=False)
+    response = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert response.status_code == 400
+    assert response.json()["detail"] == "No bus is currently travelling through this route."
+    assert db_session.query(MissedBusAllotment).filter(MissedBusAllotment.student_id == env["student"].id).count() == 0
+
+
+def test_missed_bus_repeat_post_reuses_allotment_and_notification(setup_test_environment, db_session, monkeypatch):
+    env = setup_test_environment
+    _mock_missed_bus_routes(monkeypatch, env)
+    _create_missed_bus_trips(db_session, env)
+    first = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    second = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert first.status_code == second.status_code == 200
+    assert first.json()["allotment_id"] == second.json()["allotment_id"]
+    assert db_session.query(MissedBusAllotment).filter(MissedBusAllotment.student_id == env["student"].id).count() == 1
+    assert db_session.query(Notification).filter(Notification.user_id == env["user_student"].id, Notification.type == "alternative_bus_allotted").count() == 1
+
+
+def test_missed_bus_rejects_not_travelling_student(setup_test_environment, db_session):
+    env = setup_test_environment
+    db_session.add(TravelStatus(student_id=env["student"].id, date=date.today(), status="not_travelling"))
+    db_session.commit()
+    response = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert response.status_code == 400
+    assert response.json()["detail"] == "You marked yourself as not travelling today"
+
+
+def test_missed_bus_request_coordinates_require_a_pair(setup_test_environment):
+    env = setup_test_environment
+    invalid = client.post("/student/missed-bus/allot", json={"latitude": 17.98}, headers=env["headers_student"])
+    accepted = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert invalid.status_code == 422
+    assert accepted.status_code == 400
+    assert accepted.json()["detail"] == "Your bus hasn't started yet."
+
+
+def test_missed_bus_uses_active_custom_temporary_stop(setup_test_environment, db_session, monkeypatch):
+    env = setup_test_environment
+    _mock_missed_bus_routes(monkeypatch, env)
+    _create_missed_bus_trips(db_session, env)
+    custom_stop = Stop(route_id=env["bus1"].route_id, name="TEST Custom Stop", latitude=env["stop_a1"].latitude,
+                       longitude=env["stop_a1"].longitude, stop_order=99, is_custom=True, is_active=True,
+                       created_by_student_id=env["student"].id)
+    db_session.add(custom_stop)
+    db_session.commit()
+    db_session.add(TemporaryStopChange(student_id=env["student"].id, original_stop_id=env["stop_a1"].id,
+                                       temporary_stop_id=custom_stop.id, start_date=date.today(), end_date=date.today(), status="active"))
+    db_session.commit()
+    response = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert response.status_code == 200
+    assert response.json()["stop_id"] == custom_stop.id
+
+
+def test_missed_bus_rejects_active_original_trip_without_gps(setup_test_environment, db_session, monkeypatch):
+    env = setup_test_environment
+    _mock_missed_bus_routes(monkeypatch, env)
+    original_trip = Trip(bus_id=env["bus1"].id, driver_id=env["driver"].id, route_id=env["bus1"].route_id,
+                         status="active", started_at=datetime.utcnow())
+    alternative_trip = Trip(bus_id=env["bus2"].id, driver_id=env["driver"].id, route_id=env["bus2"].route_id,
+                            status="active", started_at=datetime.utcnow())
+    db_session.add_all([original_trip, alternative_trip])
+    db_session.commit()
+    response = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Your bus has not reached your stop yet."
+
+
+def test_missed_bus_active_trip_filter_does_not_change_temporary_stop_preview(setup_test_environment, monkeypatch):
+    env = setup_test_environment
+    _mock_missed_bus_routes(monkeypatch, env)
+    response = client.post("/student/temporary-stop-change/check-route", json={"stop_id": env["stop_b1"].id}, headers=env["headers_student"])
+    assert response.status_code == 200
+    assert env["bus2"].id in [candidate["bus_id"] for candidate in response.json()["candidate_buses"]]
 
 
 # =====================================================================
@@ -865,4 +1017,126 @@ def test_route_matching_along_long_stretch_between_distant_stops():
         assert round(dist_off, 2) > ROUTE_MATCH_TOLERANCE_M, f"Point 45m off road at {int(frac*100)}% must be rejected (got {dist_off:.2f}m)"
 
 
+# =====================================================================
+# 7. SECURITY TESTS: POST /admin/create
+# =====================================================================
 
+def test_admin_create_unauthenticated_rejected():
+    """
+    POST /admin/create with no token must be rejected with 401 or 403.
+    The endpoint now requires a super-admin JWT; unauthenticated callers
+    must not be able to create accounts.
+    """
+    resp = client.post(
+        "/admin/create",
+        params={"name": "Hacker", "phone": "0000000001", "password": "hacked"},
+    )
+    assert resp.status_code in (401, 403), (
+        f"Expected 401 or 403 for unauthenticated request, got {resp.status_code}"
+    )
+
+
+def test_admin_create_regular_admin_rejected(setup_test_environment):
+    """
+    A regular admin token must NOT be able to call POST /admin/create.
+    Only super-admins are authorised.
+    """
+    env = setup_test_environment
+    resp = client.post(
+        "/admin/create",
+        params={"name": "SomeAdmin", "phone": "0000000002", "password": "pass123"},
+        headers=env["headers_admin"],
+    )
+    assert resp.status_code in (401, 403), (
+        f"Expected 401 or 403 for regular admin, got {resp.status_code}"
+    )
+
+
+def test_admin_create_super_admin_creates_admin_role(setup_test_environment, db_session):
+    """
+    A super-admin token can create a new account with role='admin' (default).
+    The created user must have role='admin' in the response.
+    """
+    env = setup_test_environment
+    test_phone = "0000000003"
+    # Clean up any leftover record from a previous run
+    db_session.query(User).filter(User.phone == test_phone).delete()
+    db_session.commit()
+
+    resp = client.post(
+        "/admin/create",
+        params={"name": "New Admin", "phone": test_phone, "password": "secure123", "role": "admin"},
+        headers=env["headers_super_admin"],
+    )
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["role"] == "admin"
+    assert data["phone"] == test_phone
+
+    # Cleanup
+    db_session.query(User).filter(User.phone == test_phone).delete()
+    db_session.commit()
+
+
+def test_admin_create_super_admin_creates_super_admin_role(setup_test_environment, db_session):
+    """
+    A super-admin token can create a new account with role='super_admin'.
+    The created user must have role='super_admin' in the response.
+    """
+    env = setup_test_environment
+    test_phone = "0000000004"
+    db_session.query(User).filter(User.phone == test_phone).delete()
+    db_session.commit()
+
+    resp = client.post(
+        "/admin/create",
+        params={"name": "New Super Admin", "phone": test_phone, "password": "secure456", "role": "super_admin"},
+        headers=env["headers_super_admin"],
+    )
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["role"] == "super_admin"
+    assert data["phone"] == test_phone
+
+    # Cleanup
+    db_session.query(User).filter(User.phone == test_phone).delete()
+    db_session.commit()
+
+
+def test_admin_create_invalid_role_rejected(setup_test_environment):
+    """
+    Passing an invalid role (e.g. 'driver') to POST /admin/create must be
+    rejected with HTTP 400 regardless of the caller's authority.
+    """
+    env = setup_test_environment
+    resp = client.post(
+        "/admin/create",
+        params={"name": "Bad Role", "phone": "0000000005", "password": "pass123", "role": "driver"},
+        headers=env["headers_super_admin"],
+    )
+    assert resp.status_code == 400, (
+        f"Expected 400 for invalid role 'driver', got {resp.status_code}: {resp.text}"
+    )
+    assert "role" in resp.json()["detail"].lower()
+
+
+def test_admin_create_default_role_is_admin(setup_test_environment, db_session):
+    """
+    When no role is specified the endpoint must default to 'admin'.
+    """
+    env = setup_test_environment
+    test_phone = "0000000006"
+    db_session.query(User).filter(User.phone == test_phone).delete()
+    db_session.commit()
+
+    resp = client.post(
+        "/admin/create",
+        params={"name": "Default Role Admin", "phone": test_phone, "password": "pass123"},
+        headers=env["headers_super_admin"],
+    )
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    assert resp.json()["role"] == "admin"
+
+    # Cleanup
+    db_session.query(User).filter(User.phone == test_phone).delete()
+    db_session.commit()

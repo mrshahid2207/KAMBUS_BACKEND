@@ -2094,6 +2094,7 @@ def find_candidate_buses_for_location(
     lng: float | None = None,
     exclude_bus_id: int | None = None,
     student_bus_id: int | None = None,
+    require_active_trip: bool = False,
 ) -> tuple[list[dict], bool, float | None]:
     """
     Find active candidate buses covering a given registered stop or lat/lng coordinates.
@@ -2104,9 +2105,11 @@ def find_candidate_buses_for_location(
     exclude_bus_id : hard-exclude a bus (used by Missed Bus where the student's
                      own bus is the one they missed — excluding it is correct).
     student_bus_id : the student's currently-assigned bus (used by Temporary
-                     Stop Change). If this bus covers the stop it is included
-                     AND ranked first. When the student's own bus covers the
-                     stop, OTHER buses are excluded (no need to switch buses).
+                      Stop Change). If this bus covers the stop it is included
+                      AND ranked first. When the student's own bus covers the
+                      stop, OTHER buses are excluded (no need to switch buses).
+    require_active_trip : only return buses with an active trip (used by
+                          Missed Bus, whose allotments require one).
     """
     buses = db.query(Bus).filter(Bus.status == "active").all()
     if not buses:
@@ -2153,6 +2156,10 @@ def find_candidate_buses_for_location(
                     global_min_dist = dist_m
 
         if is_match:
+            active_trip = get_active_trip_for_bus(db, bus.id)
+            if require_active_trip and not active_trip:
+                continue
+
             driver_name = None
             driver_phone = None
             if bus.driver_id:
@@ -2165,7 +2172,6 @@ def find_candidate_buses_for_location(
 
             eta_mins = None
             live_distance_m = None
-            active_trip = get_active_trip_for_bus(db, bus.id)
             target_stop = st if stop_id is not None else None
             if lat is not None and lng is not None:
                 # get_eta_minutes_to_stop only needs latitude/longitude; this
@@ -2337,6 +2343,7 @@ def choose_alternative_bus_for_student(
         lat=lat,
         lng=lng,
         exclude_bus_id=original_bus.id,
+        require_active_trip=True,
     )
 
     if not candidates:
@@ -2438,6 +2445,12 @@ def automatically_allot_alternative_bus(
         raise HTTPException(status_code=404, detail="Current bus or stop could not be found")
 
     original_trip = get_active_trip_for_bus(db, original_bus.id)
+    if original_trip:
+        if not has_passed_stop(db, original_trip, stop):
+            raise HTTPException(status_code=400, detail="Your bus has not reached your stop yet.")
+    else:
+        raise HTTPException(status_code=400, detail="Your bus hasn't started yet.")
+
     alternative_bus, alternative_trip, eta = choose_alternative_bus_for_student(
         db,
         student,
@@ -2446,7 +2459,7 @@ def automatically_allot_alternative_bus(
         data.latitude,
         data.longitude,
     )
-    if not alternative_bus:
+    if not alternative_bus or not alternative_trip:
         raise HTTPException(
             status_code=400,
             detail="No bus is currently travelling through this route.",
@@ -2523,6 +2536,8 @@ def get_alternative_bus_allotment(
         else None
     )
     stop = db.query(Stop).filter(Stop.id == allotment.stop_id).first()
+    if not bus or not stop:
+        return {"active": False}
 
     return {
         "active": True,
@@ -5091,12 +5106,32 @@ def get_admin_activity_logs(
 
 
 @app.post("/admin/create")
-def create_admin(name: str, phone: str, password: str, db: Session = Depends(get_db)):
+def create_admin(
+    name: str,
+    phone: str,
+    password: str,
+    role: str = "admin",
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_super_admin),
+):
+    """Create a new admin or super-admin account.
+
+    Only super-admins may call this endpoint.
+    ``role`` must be one of ``"admin"`` or ``"super_admin"``; defaults to
+    ``"admin"`` if not supplied.
+    """
+    VALID_ROLES = {"admin", "super_admin"}
+    if role not in VALID_ROLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid role '{role}'. Must be one of: {sorted(VALID_ROLES)}",
+        )
+
     existing_user = db.query(User).filter(User.phone == phone).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="Phone number already registered")
 
-    admin = User(name=name, phone=phone, password_hash=hash_password(password), role="admin")
+    admin = User(name=name, phone=phone, password_hash=hash_password(password), role=role)
     db.add(admin)
     db.commit()
     db.refresh(admin)
@@ -5106,7 +5141,7 @@ def create_admin(name: str, phone: str, password: str, db: Session = Depends(get
         "admin_id": admin.id,
         "name": admin.name,
         "phone": admin.phone,
-        "role": admin.role
+        "role": admin.role,
     }
 
 
