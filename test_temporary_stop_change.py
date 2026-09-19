@@ -679,6 +679,33 @@ def test_missed_bus_request_coordinates_require_a_pair(setup_test_environment):
     assert accepted.json()["detail"] == "Your bus hasn't started yet."
 
 
+def test_missed_bus_rejects_out_of_range_coordinates(setup_test_environment):
+    env = setup_test_environment
+    invalid = client.post("/student/missed-bus/allot", json={"latitude": 91, "longitude": 0}, headers=env["headers_student"])
+    accepted = client.post("/student/missed-bus/allot", json={"latitude": 13.0, "longitude": 80.0}, headers=env["headers_student"])
+    assert invalid.status_code == 422
+    assert accepted.status_code == 400
+    assert accepted.json()["detail"] == "Your bus hasn't started yet."
+
+
+def test_missed_bus_response_contract_for_student_frontend(setup_test_environment, db_session, monkeypatch):
+    env = setup_test_environment
+    _mock_missed_bus_routes(monkeypatch, env)
+    _create_missed_bus_trips(db_session, env)
+    post_response = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    get_response = client.get("/student/missed-bus/allotment", headers=env["headers_student"])
+    bus_response = client.get("/student/my-bus", headers=env["headers_student"])
+    assert post_response.status_code == get_response.status_code == bus_response.status_code == 200
+    post_data = post_response.json()
+    get_data = get_response.json()
+    bus_data = bus_response.json()
+    assert {"message", "alternative_bus_id", "alternative_bus_number", "eta_minutes", "stop_id", "stop_name", "original_bus_id", "original_bus_number"}.issubset(post_data)
+    assert {"active", "alternative_bus_id", "alternative_bus_number", "stop_id", "stop_name", "trip_active", "original_bus_id"}.issubset(get_data)
+    assert bus_data["alternative_bus"] is True
+    assert bus_data["bus_id"] == post_data["alternative_bus_id"] == get_data["alternative_bus_id"]
+    assert bus_data["original_bus_number"] == post_data["original_bus_number"]
+
+
 def test_missed_bus_uses_active_custom_temporary_stop(setup_test_environment, db_session, monkeypatch):
     env = setup_test_environment
     _mock_missed_bus_routes(monkeypatch, env)
