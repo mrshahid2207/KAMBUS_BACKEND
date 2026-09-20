@@ -1317,3 +1317,107 @@ def test_legacy_create_route_still_works_for_admin(setup_test_environment, db_se
     assert resp.status_code == 200, resp.text
     db_session.query(Route).filter(Route.name == "TEST Auth Route OK").delete()
     db_session.commit()
+
+
+# =====================================================================
+# ATTEMPT LIMITS: login lockout and OTP guess limit
+# =====================================================================
+
+@pytest.fixture(autouse=True)
+def _reset_attempt_limits():
+    import main as _main
+    _main._FAILED_LOGINS.clear()
+    _main._OTP_WRONG_GUESSES.clear()
+    yield
+    _main._FAILED_LOGINS.clear()
+    _main._OTP_WRONG_GUESSES.clear()
+
+
+def _login(identifier, password, role="student"):
+    return client.post("/auth/login", json={"identifier": identifier, "password": password, "role": role})
+
+
+def test_login_locks_after_five_failures_even_with_correct_password(setup_test_environment):
+    for _ in range(5):
+        assert _login("TEST_ROLL_101", "wrong-password").status_code == 401
+    locked = _login("TEST_ROLL_101", "pass123")
+    assert locked.status_code == 429
+    assert "Too many failed sign-in attempts" in locked.json()["detail"]
+    # a different account is unaffected
+    assert _login("TEST_ROLL_102", "pass123").status_code == 200
+
+
+def test_login_success_clears_failure_count(setup_test_environment):
+    for _ in range(4):
+        assert _login("TEST_ROLL_101", "wrong-password").status_code == 401
+    assert _login("TEST_ROLL_101", "pass123").status_code == 200
+    for _ in range(4):
+        assert _login("TEST_ROLL_101", "wrong-password").status_code == 401
+    assert _login("TEST_ROLL_101", "pass123").status_code == 200
+
+
+def test_login_lock_expires_after_window(setup_test_environment, monkeypatch):
+    import main as _main
+    for _ in range(5):
+        _login("TEST_ROLL_101", "wrong-password")
+    assert _login("TEST_ROLL_101", "pass123").status_code == 429
+    real = _main._monotonic
+    monkeypatch.setattr(_main, "_monotonic", lambda: real() + _main.LOGIN_FAILURE_WINDOW_SECONDS + 5)
+    assert _login("TEST_ROLL_101", "pass123").status_code == 200
+
+
+def test_admin_login_with_non_numeric_id_counts_toward_lockout(setup_test_environment):
+    for _ in range(5):
+        assert _login("not-a-number", "x", role="admin").status_code == 401
+    assert _login("not-a-number", "x", role="admin").status_code == 429
+
+
+def _make_unverified_student_with_otp(db, code="123456"):
+    from models import StudentOTP
+    from main import hash_otp
+    db.query(StudentOTP).filter(StudentOTP.email == "test_otp@kambus.test").delete()
+    db.query(User).filter(User.email == "test_otp@kambus.test").delete()
+    db.commit()
+    user = User(name="Test OTP", email="test_otp@kambus.test", phone="9999922222",
+                password_hash=hash_password("pass123"), role="student", is_verified=0)
+    db.add(user)
+    db.commit()
+    db.add(StudentOTP(email="test_otp@kambus.test", otp_code=hash_otp(code), user_id=user.id,
+                      expires_at=datetime.utcnow() + timedelta(minutes=10), is_used=0))
+    db.commit()
+    return user
+
+
+def _cleanup_otp_user(db):
+    from models import StudentOTP
+    db.query(StudentOTP).filter(StudentOTP.email == "test_otp@kambus.test").delete()
+    db.query(User).filter(User.email == "test_otp@kambus.test").delete()
+    db.commit()
+
+
+def _verify(code):
+    return client.post("/auth/student/verify-otp", json={"email": "test_otp@kambus.test", "otp_code": code})
+
+
+def test_otp_is_burned_after_five_wrong_guesses(setup_test_environment, db_session):
+    _make_unverified_student_with_otp(db_session)
+    for _ in range(4):
+        assert _verify("000000").status_code == 400
+    fifth = _verify("000000")
+    assert fifth.status_code == 429
+    assert "request a new code" in fifth.json()["detail"]
+    # even the right code no longer works: the code was burned
+    after = _verify("123456")
+    assert after.status_code == 400
+    assert "No active verification code" in after.json()["detail"]
+    _cleanup_otp_user(db_session)
+
+
+def test_otp_correct_code_still_works_after_a_few_wrong_guesses(setup_test_environment, db_session):
+    _make_unverified_student_with_otp(db_session)
+    for _ in range(4):
+        assert _verify("000000").status_code == 400
+    ok = _verify("123456")
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["success"] is True
+    _cleanup_otp_user(db_session)

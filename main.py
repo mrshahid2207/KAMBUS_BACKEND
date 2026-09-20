@@ -6,6 +6,7 @@ from math import asin, cos, radians, sin, sqrt, atan2
 import json
 import logging
 import asyncio
+import time
 import hashlib
 import hmac
 import urllib.request
@@ -716,8 +717,53 @@ def mark_all_notifications_read(
 # AUTHENTICATION
 # ============================================================
 
+# ------------------------------------------------------------
+# Failed-attempt limits (kept in memory: per server process, reset on restart)
+# ------------------------------------------------------------
+LOGIN_MAX_FAILURES = 5
+LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
+OTP_MAX_WRONG_GUESSES = 5
+_monotonic = time.monotonic
+_FAILED_LOGINS: dict[str, list[float]] = {}
+_OTP_WRONG_GUESSES: dict[int, int] = {}
+
+
+def _login_key(role, identifier) -> str:
+    return f"{str(role).strip().lower()}:{str(identifier).strip().lower()}"
+
+
+def _recent_login_failures(key: str) -> list[float]:
+    cutoff = _monotonic() - LOGIN_FAILURE_WINDOW_SECONDS
+    recent = [t for t in _FAILED_LOGINS.get(key, []) if t > cutoff]
+    if recent:
+        _FAILED_LOGINS[key] = recent
+    else:
+        _FAILED_LOGINS.pop(key, None)
+    return recent
+
+
+def _check_login_not_locked(key: str) -> None:
+    recent = _recent_login_failures(key)
+    if len(recent) >= LOGIN_MAX_FAILURES:
+        seconds_left = int(recent[0] + LOGIN_FAILURE_WINDOW_SECONDS - _monotonic()) + 1
+        minutes_left = max(1, (seconds_left + 59) // 60)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed sign-in attempts. Try again in {minutes_left} minute(s).",
+        )
+
+
+def _record_login_failure(key: str) -> None:
+    if len(_FAILED_LOGINS) > 5000:  # keep memory bounded
+        for stale_key in list(_FAILED_LOGINS):
+            _recent_login_failures(stale_key)
+    _FAILED_LOGINS.setdefault(key, []).append(_monotonic())
+
+
 @app.post("/auth/login", response_model=LoginResponse)
 def login(data: LoginRequest, db: Session = Depends(get_db)):
+    login_key = _login_key(data.role, data.identifier)
+    _check_login_not_locked(login_key)
     user = None
 
     if data.role == "student":
@@ -734,6 +780,7 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
         try:
             admin_id = int(data.identifier)
         except ValueError:
+            _record_login_failure(login_key)
             raise HTTPException(status_code=401, detail="Invalid admin ID or password")
 
         user = db.query(User).filter(User.id == admin_id, User.role.in_(["admin", "super_admin"])).first()
@@ -742,10 +789,14 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Invalid role")
 
     if not user:
+        _record_login_failure(login_key)
         raise HTTPException(status_code=401, detail="Invalid ID or password")
 
     if not verify_password(data.password, user.password_hash):
+        _record_login_failure(login_key)
         raise HTTPException(status_code=401, detail="Invalid ID or password")
+
+    _FAILED_LOGINS.pop(login_key, None)
 
     if user.role == "student" and getattr(user, "is_verified", 1) == 0:
         raise HTTPException(
@@ -907,7 +958,17 @@ def verify_student_otp(data: StudentVerifyOtpRequest, db: Session = Depends(get_
         raise HTTPException(status_code=400, detail="Verification code has expired. Please request a new code.")
 
     if not verify_otp_hash(otp_code, otp_record.otp_code):
+        wrong_guesses = _OTP_WRONG_GUESSES.get(otp_record.id, 0) + 1
+        if wrong_guesses >= OTP_MAX_WRONG_GUESSES:
+            # Burn this code: guessing must restart with a newly requested code.
+            otp_record.is_used = 1
+            db.commit()
+            _OTP_WRONG_GUESSES.pop(otp_record.id, None)
+            raise HTTPException(status_code=429, detail="Too many incorrect attempts. Please request a new code.")
+        _OTP_WRONG_GUESSES[otp_record.id] = wrong_guesses
         raise HTTPException(status_code=400, detail="Invalid verification code. Please check the code and try again.")
+
+    _OTP_WRONG_GUESSES.pop(otp_record.id, None)
 
     # Mark OTP as used
     otp_record.is_used = 1
