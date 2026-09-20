@@ -1189,10 +1189,17 @@ def test_super_admin_account_cannot_be_disabled_through_the_api(setup_test_envir
 
 # ---- create_superadmin.py (server-side, one-time) ----
 
-def test_create_superadmin_refuses_when_one_exists(setup_test_environment, db_session):
-    from create_superadmin import create_superadmin
-    with pytest.raises(ValueError, match="already exists"):
-        create_superadmin(db_session, "Owner", "0000000009", "a-very-long-password-1")
+def test_create_superadmin_allows_three_then_refuses(setup_test_environment, db_session):
+    from create_superadmin import MAX_SUPERADMINS, create_superadmin
+    assert MAX_SUPERADMINS == 3
+    for phone in ("0000000009", "0000000010"):
+        _drop_users_by_phone(db_session, phone)
+    create_superadmin(db_session, "Owner 2", "0000000009", "a-very-long-password-1")
+    create_superadmin(db_session, "Owner 3", "0000000010", "a-very-long-password-1")
+    with pytest.raises(ValueError, match="already exist"):
+        create_superadmin(db_session, "Owner 4", "0000000011", "a-very-long-password-1")
+    for phone in ("0000000009", "0000000010"):
+        _drop_users_by_phone(db_session, phone)
 
 
 def test_create_superadmin_rejects_short_password(setup_test_environment, db_session):

@@ -3,9 +3,10 @@ One-time setup: create the super-admin account on the server.
 
     python create_superadmin.py
 
-Needs DATABASE_URL to be set (the same one the app uses). Only one super-admin can
-be created this way. Sign in with the printed ID and the password you choose,
-using the Admin tab of the login screen.
+Needs DATABASE_URL to be set (the same one the app uses). Up to MAX_SUPERADMINS
+super-admins can be created this way; run the script once per account. Sign in
+with the printed ID and the password you choose, using the Admin tab of the
+login screen.
 """
 import getpass
 import sys
@@ -16,6 +17,7 @@ from database import Base, SessionLocal, engine
 from models import User
 
 MIN_PASSWORD_LENGTH = 12
+MAX_SUPERADMINS = 3
 
 
 def create_superadmin(db, name: str, phone: str, password: str) -> User:
@@ -25,8 +27,8 @@ def create_superadmin(db, name: str, phone: str, password: str) -> User:
         raise ValueError("Name and phone are required.")
     if len(password) < MIN_PASSWORD_LENGTH:
         raise ValueError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
-    if db.query(User).filter(User.role == "super_admin").first():
-        raise ValueError("A super-admin already exists. This script only creates the first one.")
+    if db.query(User).filter(User.role == "super_admin").count() >= MAX_SUPERADMINS:
+        raise ValueError(f"{MAX_SUPERADMINS} super-admins already exist. This script will not create more.")
     if db.query(User).filter(User.phone == phone).first():
         raise ValueError("That phone number is already registered.")
 
