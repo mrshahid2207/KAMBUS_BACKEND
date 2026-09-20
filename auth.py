@@ -1,3 +1,4 @@
+import os
 from pwdlib import PasswordHash
 from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
@@ -30,7 +31,9 @@ def verify_password(
 # JWT CONFIG
 # =========================
 
-SECRET_KEY = "KAMBUS_CHANGE_THIS_SECRET_KEY"
+SECRET_KEY = os.getenv("JWT_SECRET")
+if not SECRET_KEY or len(SECRET_KEY) < 32:
+    raise RuntimeError("JWT_SECRET must be set to a random string of at least 32 characters")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 

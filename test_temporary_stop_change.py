@@ -1280,3 +1280,40 @@ def test_missed_bus_capacity_enforced_once_a_capacity_value_exists(setup_test_en
     resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
     assert resp.status_code == 200, resp.text
     assert resp.json()["alternative_bus_id"] == env["bus3"].id
+
+
+# =====================================================================
+# ACCESS CONTROL: legacy create endpoints must require an admin token
+# =====================================================================
+
+@pytest.mark.parametrize("method,path,body", [
+    ("post", "/routes", {"name": "TEST Auth Route"}),
+    ("post", "/buses", {"bus_number": "TEST-AUTH-1"}),
+    ("post", "/routes/1/stops", {"name": "TEST Auth Stop", "latitude": 17.98, "longitude": 79.53, "stop_order": 1}),
+    ("post", "/students", {"name": "TEST Auth", "phone": "9999911111", "password": "pass123", "roll_number": "TEST_AUTH_1"}),
+    ("post", "/drivers", {"name": "TEST Auth", "phone": "9999911112", "password": "pass123", "driver_code": "TEST_AUTH_D", "license_number": "L1"}),
+    ("post", "/buses/1/assign-driver", {"driver_code": "TEST_AUTH_D"}),
+])
+def test_legacy_create_endpoints_reject_anonymous_and_non_admin(setup_test_environment, db_session, method, path, body):
+    env = setup_test_environment
+    before = (db_session.query(Route).count(), db_session.query(Bus).count(), db_session.query(User).count())
+
+    anonymous = getattr(client, method)(path, json=body)
+    assert anonymous.status_code in (401, 403)
+
+    as_student = getattr(client, method)(path, json=body, headers=env["headers_student"])
+    assert as_student.status_code == 403
+    as_driver = getattr(client, method)(path, json=body, headers=env["headers_driver"])
+    assert as_driver.status_code == 403
+
+    db_session.expire_all()
+    after = (db_session.query(Route).count(), db_session.query(Bus).count(), db_session.query(User).count())
+    assert before == after
+
+
+def test_legacy_create_route_still_works_for_admin(setup_test_environment, db_session):
+    env = setup_test_environment
+    resp = client.post("/routes", json={"name": "TEST Auth Route OK"}, headers=env["headers_admin"])
+    assert resp.status_code == 200, resp.text
+    db_session.query(Route).filter(Route.name == "TEST Auth Route OK").delete()
+    db_session.commit()

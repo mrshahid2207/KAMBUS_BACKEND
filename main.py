@@ -1096,7 +1096,7 @@ def student_select_pickup_stop(
 # ============================================================
 
 @app.post("/routes")
-def create_route(data: RouteCreate, db: Session = Depends(get_db)):
+def create_route(data: RouteCreate, db: Session = Depends(get_db), current_admin: dict = Depends(require_admin)):
     route = Route(name=data.name, description=data.description)
     db.add(route)
     db.commit()
@@ -1105,7 +1105,7 @@ def create_route(data: RouteCreate, db: Session = Depends(get_db)):
 
 
 @app.post("/buses")
-def create_bus(data: BusCreate, db: Session = Depends(get_db)):
+def create_bus(data: BusCreate, db: Session = Depends(get_db), current_admin: dict = Depends(require_admin)):
     bus = Bus(
         bus_number=data.bus_number,
         route_id=data.route_id,
@@ -1120,7 +1120,7 @@ def create_bus(data: BusCreate, db: Session = Depends(get_db)):
 
 
 @app.post("/routes/{route_id}/stops")
-def create_stop(route_id: int, data: StopCreate, db: Session = Depends(get_db)):
+def create_stop(route_id: int, data: StopCreate, db: Session = Depends(get_db), current_admin: dict = Depends(require_admin)):
     route = db.query(Route).filter(Route.id == route_id).first()
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
@@ -1290,7 +1290,7 @@ def create_driver_complaint(
 # ============================================================
 
 @app.post("/students")
-def create_student(data: StudentCreate, db: Session = Depends(get_db)):
+def create_student(data: StudentCreate, db: Session = Depends(get_db), current_admin: dict = Depends(require_admin)):
     existing_user = db.query(User).filter(User.phone == data.phone).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="Phone number already registered")
@@ -1582,7 +1582,7 @@ def get_bus_location(
 
 
 @app.post("/drivers")
-def create_driver(data: DriverCreate, db: Session = Depends(get_db)):
+def create_driver(data: DriverCreate, db: Session = Depends(get_db), current_admin: dict = Depends(require_admin)):
     existing_driver = db.query(Driver).filter(Driver.driver_code == data.driver_code).first()
     if existing_driver:
         raise HTTPException(status_code=400, detail="Driver ID already registered")
@@ -1617,7 +1617,7 @@ def create_driver(data: DriverCreate, db: Session = Depends(get_db)):
 
 
 @app.post("/buses/{bus_id}/assign-driver")
-def assign_driver(bus_id: int, data: AssignDriverRequest, db: Session = Depends(get_db)):
+def assign_driver(bus_id: int, data: AssignDriverRequest, db: Session = Depends(get_db), current_admin: dict = Depends(require_admin)):
     bus = db.query(Bus).filter(Bus.id == bus_id).first()
     if not bus:
         raise HTTPException(status_code=404, detail="Bus not found")
