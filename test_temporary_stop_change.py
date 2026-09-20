@@ -1187,6 +1187,58 @@ def test_super_admin_account_cannot_be_disabled_through_the_api(setup_test_envir
     assert resp.status_code == 404
 
 
+# ---- admins sign in by name ----
+
+def test_admin_can_sign_in_by_name_ignoring_case_and_spaces(setup_test_environment):
+    env = setup_test_environment
+    for who in ("Test Admin", "  test admin  ", "TEST ADMIN"):
+        resp = _login(who, "pass123", role="admin")
+        assert resp.status_code == 200, who
+        assert resp.json()["user_id"] == env["user_admin"].id
+    super_resp = _login("test super admin", "pass123", role="admin")
+    assert super_resp.status_code == 200
+    assert super_resp.json()["role"] == "super_admin"
+
+
+def test_admin_can_still_sign_in_by_id(setup_test_environment):
+    env = setup_test_environment
+    resp = _login(str(env["user_admin"].id), "pass123", role="admin")
+    assert resp.status_code == 200
+    assert resp.json()["user_id"] == env["user_admin"].id
+
+
+def test_admin_login_wrong_name_or_password_is_rejected(setup_test_environment):
+    unknown = _login("No Such Admin", "pass123", role="admin")
+    assert unknown.status_code == 401
+    assert "username" in unknown.json()["detail"].lower()
+    assert _login("Test Admin", "wrong-password", role="admin").status_code == 401
+
+
+def test_student_name_cannot_be_used_to_sign_in_as_admin(setup_test_environment):
+    env = setup_test_environment
+    assert _login(env["user_student"].name, "pass123", role="admin").status_code == 401
+
+
+def test_admin_create_rejects_a_name_already_in_use(setup_test_environment):
+    env = setup_test_environment
+    resp = client.post("/admin/create", json=_admin_body("0000000013", name="test ADMIN"), headers=env["headers_super_admin"])
+    assert resp.status_code == 400
+    assert "name" in resp.json()["detail"].lower()
+
+
+def test_shared_admin_name_is_rejected_but_id_still_works(setup_test_environment, db_session):
+    env = setup_test_environment
+    _drop_users_by_phone(db_session, "0000000012")
+    twin = User(name="Test Admin", phone="0000000012", password_hash=hash_password("pass123"), role="admin", is_verified=1)
+    db_session.add(twin)
+    db_session.commit()
+    try:
+        assert _login("Test Admin", "pass123", role="admin").status_code == 401
+        assert _login(str(twin.id), "pass123", role="admin").status_code == 200
+    finally:
+        _drop_users_by_phone(db_session, "0000000012")
+
+
 # ---- create_superadmin.py (server-side, one-time) ----
 
 def test_create_superadmin_allows_three_then_refuses(setup_test_environment, db_session):

@@ -5,13 +5,14 @@ One-time setup: create the super-admin account on the server.
 
 Needs DATABASE_URL to be set (the same one the app uses). Up to MAX_SUPERADMINS
 super-admins can be created this way; run the script once per account. Sign in
-with the printed ID and the password you choose, using the Admin tab of the
+with the name you entered (or the printed ID) and the password you chose, using the Admin tab of the
 login screen.
 """
 import getpass
 import sys
 
 from pwdlib import PasswordHash
+from sqlalchemy import func
 
 from database import Base, SessionLocal, engine
 from models import User
@@ -31,6 +32,12 @@ def create_superadmin(db, name: str, phone: str, password: str) -> User:
         raise ValueError(f"{MAX_SUPERADMINS} super-admins already exist. This script will not create more.")
     if db.query(User).filter(User.phone == phone).first():
         raise ValueError("That phone number is already registered.")
+    if (
+        db.query(User)
+        .filter(User.role.in_(["admin", "super_admin", "disabled_admin"]), func.lower(User.name) == name.lower())
+        .first()
+    ):
+        raise ValueError("An admin with that name already exists. Admins sign in by name, so it must be unique.")
 
     user = User(
         name=name,
@@ -63,7 +70,7 @@ def main() -> int:
     finally:
         db.close()
 
-    print(f"Super-admin created. Sign in on the Admin tab with ID {user.id} and your password.")
+    print(f"Super-admin created. Sign in on the Admin tab with the name '{user.name}' (or ID {user.id}) and your password.")
     return 0
 
 

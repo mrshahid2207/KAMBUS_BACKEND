@@ -819,24 +819,38 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
             user = db.query(User).filter(User.id == driver.user_id).first()
 
     elif data.role in ("admin", "super_admin"):
-        try:
-            admin_id = int(data.identifier)
-        except ValueError:
-            _record_login_failure(login_key)
-            raise HTTPException(status_code=401, detail="Invalid admin ID or password")
-
-        user = db.query(User).filter(User.id == admin_id, User.role.in_(["admin", "super_admin"])).first()
+        # Admins sign in with their name (case-insensitive). The numeric ID still
+        # works, and is the fallback when a name is shared by more than one account.
+        identifier = data.identifier.strip()
+        named = (
+            db.query(User)
+            .filter(User.role.in_(["admin", "super_admin"]), func.lower(User.name) == identifier.lower())
+            .all()
+        )
+        if len(named) == 1:
+            user = named[0]
+        else:
+            try:
+                admin_id = int(identifier)
+            except ValueError:
+                admin_id = None
+            if admin_id is not None:
+                user = db.query(User).filter(User.id == admin_id, User.role.in_(["admin", "super_admin"])).first()
 
     else:
         raise HTTPException(status_code=400, detail="Invalid role")
 
+    bad_login_detail = (
+        "Invalid username or password" if data.role in ("admin", "super_admin") else "Invalid ID or password"
+    )
+
     if not user:
         _record_login_failure(login_key)
-        raise HTTPException(status_code=401, detail="Invalid ID or password")
+        raise HTTPException(status_code=401, detail=bad_login_detail)
 
     if not verify_password(data.password, user.password_hash):
         _record_login_failure(login_key)
-        raise HTTPException(status_code=401, detail="Invalid ID or password")
+        raise HTTPException(status_code=401, detail=bad_login_detail)
 
     _FAILED_LOGINS.pop(login_key, None)
 
@@ -5303,6 +5317,15 @@ def create_admin(
     existing_user = db.query(User).filter(User.phone == phone).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="Phone number already registered")
+
+    # Admins sign in by name, so a name can belong to only one admin account.
+    name_taken = (
+        db.query(User)
+        .filter(User.role.in_(["admin", "super_admin", "disabled_admin"]), func.lower(User.name) == name.lower())
+        .first()
+    )
+    if name_taken:
+        raise HTTPException(status_code=400, detail="An admin with this name already exists")
 
     admin = User(name=name, phone=phone, password_hash=hash_password(data.password), role="admin")
     db.add(admin)
