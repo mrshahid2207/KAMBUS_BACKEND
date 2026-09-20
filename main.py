@@ -78,6 +78,8 @@ from schemas import (
     TemporaryStopChangeCreate,
     TemporaryStopCheckRequest,
     AdminTemporaryStopActionRequest,
+    AdminCreateRequest,
+    AdminPasswordReset,
     MissedBusAllotmentRequest
 )
 from email_service import generate_otp_code, send_student_verification_email
@@ -3105,6 +3107,39 @@ def reject_temporary_stop_request(
     }
 
 
+@app.delete("/admin/temporary-stop-requests/{change_id}")
+def delete_temporary_stop_request(
+    change_id: int,
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(require_admin),
+):
+    """Permanently remove a temporary stop change. A live one stops applying at once
+    and the student is told; the deletion is recorded in the admin activity log."""
+    change = db.query(TemporaryStopChange).filter(TemporaryStopChange.id == change_id).first()
+    if not change:
+        raise HTTPException(status_code=404, detail="Temporary stop request not found")
+
+    student = db.query(Student).filter(Student.id == change.student_id).first()
+    was_live = change.status in ("active", "scheduled", "pending_admin_approval")
+    roll = student.roll_number if student else f"#{change.student_id}"
+    summary = f"Deleted temporary stop change for {roll} ({change.start_date} to {change.end_date}, status {change.status}, location {change.selected_address or change.selected_latitude})"[:500]
+
+    _deactivate_custom_stop(db, change)
+    db.delete(change)
+    if was_live and student:
+        send_notification(
+            db=db,
+            user_id=student.user_id,
+            title="Temporary stop removed",
+            message="The transport office removed your temporary stop change. You are back on your regular stop and bus.",
+            notification_type="temporary_stop_removed",
+        )
+    db.commit()
+    log_admin_activity(db, current_admin["user_id"], "DELETE_TEMPORARY_STOP", "temporary_stop_change", str(change_id), summary)
+
+    return {"success": True, "message": "Temporary stop change deleted", "request_id": change_id}
+
+
 
 # ============================================================
 # WAIT REQUESTS (STUDENT & DRIVER)
@@ -5241,36 +5276,39 @@ def get_admin_activity_logs(
     return {"logs": result}
 
 
+MIN_ADMIN_PASSWORD_LENGTH = 10
+
+
 @app.post("/admin/create")
 def create_admin(
-    name: str,
-    phone: str,
-    password: str,
-    role: str = "admin",
+    data: AdminCreateRequest,
     db: Session = Depends(get_db),
     current_user: dict = Depends(require_super_admin),
 ):
-    """Create a new admin or super-admin account.
+    """Create a new admin account. Only the super-admin may call this.
 
-    Only super-admins may call this endpoint.
-    ``role`` must be one of ``"admin"`` or ``"super_admin"``; defaults to
-    ``"admin"`` if not supplied.
+    Super-admin accounts are never created through the API: the one super-admin
+    is created on the server with create_superadmin.py.
     """
-    VALID_ROLES = {"admin", "super_admin"}
-    if role not in VALID_ROLES:
+    name = data.name.strip()
+    phone = data.phone.strip()
+    if not name or not phone:
+        raise HTTPException(status_code=400, detail="Name and phone are required")
+    if len(data.password) < MIN_ADMIN_PASSWORD_LENGTH:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid role '{role}'. Must be one of: {sorted(VALID_ROLES)}",
+            detail=f"Password must be at least {MIN_ADMIN_PASSWORD_LENGTH} characters",
         )
 
     existing_user = db.query(User).filter(User.phone == phone).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="Phone number already registered")
 
-    admin = User(name=name, phone=phone, password_hash=hash_password(password), role=role)
+    admin = User(name=name, phone=phone, password_hash=hash_password(data.password), role="admin")
     db.add(admin)
     db.commit()
     db.refresh(admin)
+    log_admin_activity(db, current_user["user_id"], "CREATE_ADMIN", "admin", str(admin.id), f"Created admin {admin.name} ({admin.phone})")
 
     return {
         "message": "Admin created successfully",
@@ -5279,6 +5317,78 @@ def create_admin(
         "phone": admin.phone,
         "role": admin.role,
     }
+
+
+# A disabled admin keeps their row (so the activity log stays intact) but the
+# role no longer matches the login check, so they cannot sign in.
+def _get_admin_account(db: Session, admin_id: int) -> User:
+    target = db.query(User).filter(User.id == admin_id, User.role.in_(["admin", "disabled_admin"])).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Admin not found")
+    return target
+
+
+@app.get("/admin/admins")
+def list_admins(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_super_admin),
+):
+    admins = db.query(User).filter(User.role.in_(["admin", "disabled_admin"])).order_by(User.id).all()
+    return [
+        {
+            "admin_id": a.id,
+            "name": a.name,
+            "phone": a.phone,
+            "status": "active" if a.role == "admin" else "disabled",
+            "created_at": to_utc_iso(a.created_at),
+        }
+        for a in admins
+    ]
+
+
+@app.post("/admin/admins/{admin_id}/disable")
+def disable_admin(
+    admin_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_super_admin),
+):
+    target = _get_admin_account(db, admin_id)
+    target.role = "disabled_admin"
+    db.commit()
+    log_admin_activity(db, current_user["user_id"], "DISABLE_ADMIN", "admin", str(target.id), f"Disabled admin {target.name} ({target.phone})")
+    return {"message": "Admin disabled", "admin_id": target.id, "status": "disabled"}
+
+
+@app.post("/admin/admins/{admin_id}/enable")
+def enable_admin(
+    admin_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_super_admin),
+):
+    target = _get_admin_account(db, admin_id)
+    target.role = "admin"
+    db.commit()
+    log_admin_activity(db, current_user["user_id"], "ENABLE_ADMIN", "admin", str(target.id), f"Enabled admin {target.name} ({target.phone})")
+    return {"message": "Admin enabled", "admin_id": target.id, "status": "active"}
+
+
+@app.post("/admin/admins/{admin_id}/reset-password")
+def reset_admin_password(
+    admin_id: int,
+    data: AdminPasswordReset,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_super_admin),
+):
+    if len(data.password) < MIN_ADMIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {MIN_ADMIN_PASSWORD_LENGTH} characters",
+        )
+    target = _get_admin_account(db, admin_id)
+    target.password_hash = hash_password(data.password)
+    db.commit()
+    log_admin_activity(db, current_user["user_id"], "RESET_ADMIN_PASSWORD", "admin", str(target.id), f"Reset password for admin {target.name} ({target.phone})")
+    return {"message": "Password reset", "admin_id": target.id}
 
 
 @app.get("/driver/trip-status")

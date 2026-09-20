@@ -1065,128 +1065,209 @@ def test_route_matching_along_long_stretch_between_distant_stops():
 
 
 # =====================================================================
-# 7. SECURITY TESTS: POST /admin/create
+# 7. ADMIN MANAGEMENT: only the super-admin creates and manages admins
 # =====================================================================
 
+def _admin_body(phone, name="New Admin", password="a-long-password-1"):
+    return {"name": name, "phone": phone, "password": password}
+
+
+def _drop_users_by_phone(db, *phones):
+    for phone in phones:
+        db.query(User).filter(User.phone == phone).delete()
+    db.commit()
+
+
 def test_admin_create_unauthenticated_rejected():
-    """
-    POST /admin/create with no token must be rejected with 401 or 403.
-    The endpoint now requires a super-admin JWT; unauthenticated callers
-    must not be able to create accounts.
-    """
-    resp = client.post(
-        "/admin/create",
-        params={"name": "Hacker", "phone": "0000000001", "password": "hacked"},
-    )
-    assert resp.status_code in (401, 403), (
-        f"Expected 401 or 403 for unauthenticated request, got {resp.status_code}"
-    )
+    resp = client.post("/admin/create", json=_admin_body("0000000001"))
+    assert resp.status_code in (401, 403)
 
 
 def test_admin_create_regular_admin_rejected(setup_test_environment):
-    """
-    A regular admin token must NOT be able to call POST /admin/create.
-    Only super-admins are authorised.
-    """
     env = setup_test_environment
-    resp = client.post(
-        "/admin/create",
-        params={"name": "SomeAdmin", "phone": "0000000002", "password": "pass123"},
-        headers=env["headers_admin"],
-    )
-    assert resp.status_code in (401, 403), (
-        f"Expected 401 or 403 for regular admin, got {resp.status_code}"
-    )
+    resp = client.post("/admin/create", json=_admin_body("0000000002"), headers=env["headers_admin"])
+    assert resp.status_code in (401, 403)
 
 
-def test_admin_create_super_admin_creates_admin_role(setup_test_environment, db_session):
-    """
-    A super-admin token can create a new account with role='admin' (default).
-    The created user must have role='admin' in the response.
-    """
+def test_admin_create_by_super_admin_makes_a_working_admin(setup_test_environment, db_session):
     env = setup_test_environment
-    test_phone = "0000000003"
-    # Clean up any leftover record from a previous run
-    db_session.query(User).filter(User.phone == test_phone).delete()
-    db_session.commit()
-
-    resp = client.post(
-        "/admin/create",
-        params={"name": "New Admin", "phone": test_phone, "password": "secure123", "role": "admin"},
-        headers=env["headers_super_admin"],
-    )
-    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    _drop_users_by_phone(db_session, "0000000003")
+    resp = client.post("/admin/create", json=_admin_body("0000000003"), headers=env["headers_super_admin"])
+    assert resp.status_code == 200, resp.text
     data = resp.json()
-    assert data["role"] == "admin"
-    assert data["phone"] == test_phone
+    assert data["role"] == "admin" and data["phone"] == "0000000003"
+    login = _login(str(data["admin_id"]), "a-long-password-1", role="admin")
+    assert login.status_code == 200
+    assert login.json()["role"] == "admin"
+    _drop_users_by_phone(db_session, "0000000003")
 
-    # Cleanup
-    db_session.query(User).filter(User.phone == test_phone).delete()
-    db_session.commit()
 
-
-def test_admin_create_super_admin_creates_super_admin_role(setup_test_environment, db_session):
-    """
-    A super-admin token can create a new account with role='super_admin'.
-    The created user must have role='super_admin' in the response.
-    """
+@pytest.mark.parametrize("role", ["super_admin", "driver", "admin"])
+def test_admin_create_rejects_a_role_field(setup_test_environment, db_session, role):
+    """Admins are always created as 'admin'; asking for any role (even super_admin) is an error."""
     env = setup_test_environment
-    test_phone = "0000000004"
-    db_session.query(User).filter(User.phone == test_phone).delete()
-    db_session.commit()
-
-    resp = client.post(
-        "/admin/create",
-        params={"name": "New Super Admin", "phone": test_phone, "password": "secure456", "role": "super_admin"},
-        headers=env["headers_super_admin"],
-    )
-    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
-    data = resp.json()
-    assert data["role"] == "super_admin"
-    assert data["phone"] == test_phone
-
-    # Cleanup
-    db_session.query(User).filter(User.phone == test_phone).delete()
-    db_session.commit()
+    _drop_users_by_phone(db_session, "0000000004")
+    body = _admin_body("0000000004")
+    body["role"] = role
+    resp = client.post("/admin/create", json=body, headers=env["headers_super_admin"])
+    assert resp.status_code == 422
+    assert db_session.query(User).filter(User.phone == "0000000004").count() == 0
 
 
-def test_admin_create_invalid_role_rejected(setup_test_environment):
-    """
-    Passing an invalid role (e.g. 'driver') to POST /admin/create must be
-    rejected with HTTP 400 regardless of the caller's authority.
-    """
+def test_admin_create_rejects_short_password_and_duplicate_phone(setup_test_environment, db_session):
     env = setup_test_environment
-    resp = client.post(
-        "/admin/create",
-        params={"name": "Bad Role", "phone": "0000000005", "password": "pass123", "role": "driver"},
-        headers=env["headers_super_admin"],
-    )
-    assert resp.status_code == 400, (
-        f"Expected 400 for invalid role 'driver', got {resp.status_code}: {resp.text}"
-    )
-    assert "role" in resp.json()["detail"].lower()
+    _drop_users_by_phone(db_session, "0000000005")
+    short = client.post("/admin/create", json=_admin_body("0000000005", password="short"), headers=env["headers_super_admin"])
+    assert short.status_code == 400
+    assert client.post("/admin/create", json=_admin_body("0000000005"), headers=env["headers_super_admin"]).status_code == 200
+    duplicate = client.post("/admin/create", json=_admin_body("0000000005"), headers=env["headers_super_admin"])
+    assert duplicate.status_code == 400
+    _drop_users_by_phone(db_session, "0000000005")
 
 
-def test_admin_create_default_role_is_admin(setup_test_environment, db_session):
-    """
-    When no role is specified the endpoint must default to 'admin'.
-    """
+def test_list_admins_super_admin_only_and_hides_the_super_admin(setup_test_environment, db_session):
     env = setup_test_environment
-    test_phone = "0000000006"
-    db_session.query(User).filter(User.phone == test_phone).delete()
-    db_session.commit()
+    _drop_users_by_phone(db_session, "0000000006")
+    created = client.post("/admin/create", json=_admin_body("0000000006"), headers=env["headers_super_admin"]).json()
+    assert client.get("/admin/admins", headers=env["headers_admin"]).status_code == 403
+    assert client.get("/admin/admins").status_code in (401, 403)
+    listing = client.get("/admin/admins", headers=env["headers_super_admin"])
+    assert listing.status_code == 200
+    rows = listing.json()
+    assert any(r["admin_id"] == created["admin_id"] and r["status"] == "active" for r in rows)
+    assert env["user_super_admin"].id not in [r["admin_id"] for r in rows]
+    _drop_users_by_phone(db_session, "0000000006")
 
-    resp = client.post(
-        "/admin/create",
-        params={"name": "Default Role Admin", "phone": test_phone, "password": "pass123"},
-        headers=env["headers_super_admin"],
-    )
-    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
-    assert resp.json()["role"] == "admin"
 
-    # Cleanup
-    db_session.query(User).filter(User.phone == test_phone).delete()
+def test_disabled_admin_cannot_sign_in_until_enabled(setup_test_environment, db_session):
+    env = setup_test_environment
+    _drop_users_by_phone(db_session, "0000000007")
+    admin_id = client.post("/admin/create", json=_admin_body("0000000007"), headers=env["headers_super_admin"]).json()["admin_id"]
+    assert _login(str(admin_id), "a-long-password-1", role="admin").status_code == 200
+
+    assert client.post(f"/admin/admins/{admin_id}/disable", headers=env["headers_super_admin"]).status_code == 200
+    assert _login(str(admin_id), "a-long-password-1", role="admin").status_code == 401
+    rows = client.get("/admin/admins", headers=env["headers_super_admin"]).json()
+    assert [r["status"] for r in rows if r["admin_id"] == admin_id] == ["disabled"]
+
+    assert client.post(f"/admin/admins/{admin_id}/enable", headers=env["headers_super_admin"]).status_code == 200
+    assert _login(str(admin_id), "a-long-password-1", role="admin").status_code == 200
+    _drop_users_by_phone(db_session, "0000000007")
+
+
+def test_reset_admin_password(setup_test_environment, db_session):
+    env = setup_test_environment
+    _drop_users_by_phone(db_session, "0000000008")
+    admin_id = client.post("/admin/create", json=_admin_body("0000000008"), headers=env["headers_super_admin"]).json()["admin_id"]
+    too_short = client.post(f"/admin/admins/{admin_id}/reset-password", json={"password": "short"}, headers=env["headers_super_admin"])
+    assert too_short.status_code == 400
+    ok = client.post(f"/admin/admins/{admin_id}/reset-password", json={"password": "a-brand-new-password-2"}, headers=env["headers_super_admin"])
+    assert ok.status_code == 200
+    assert _login(str(admin_id), "a-long-password-1", role="admin").status_code == 401
+    assert _login(str(admin_id), "a-brand-new-password-2", role="admin").status_code == 200
+    _drop_users_by_phone(db_session, "0000000008")
+
+
+@pytest.mark.parametrize("method,path,body", [
+    ("post", "/admin/admins/1/disable", None),
+    ("post", "/admin/admins/1/enable", None),
+    ("post", "/admin/admins/1/reset-password", {"password": "a-long-password-1"}),
+])
+def test_regular_admin_cannot_manage_admins(setup_test_environment, method, path, body):
+    env = setup_test_environment
+    kwargs = {"headers": env["headers_admin"]}
+    if body is not None:
+        kwargs["json"] = body
+    assert getattr(client, method)(path, **kwargs).status_code == 403
+
+
+def test_super_admin_account_cannot_be_disabled_through_the_api(setup_test_environment):
+    env = setup_test_environment
+    resp = client.post(f"/admin/admins/{env['user_super_admin'].id}/disable", headers=env["headers_super_admin"])
+    assert resp.status_code == 404
+
+
+# ---- create_superadmin.py (server-side, one-time) ----
+
+def test_create_superadmin_refuses_when_one_exists(setup_test_environment, db_session):
+    from create_superadmin import create_superadmin
+    with pytest.raises(ValueError, match="already exists"):
+        create_superadmin(db_session, "Owner", "0000000009", "a-very-long-password-1")
+
+
+def test_create_superadmin_rejects_short_password(setup_test_environment, db_session):
+    from create_superadmin import create_superadmin
+    with pytest.raises(ValueError, match="at least"):
+        create_superadmin(db_session, "Owner", "0000000009", "short")
+
+
+def test_create_superadmin_creates_a_working_super_admin(setup_test_environment, db_session):
+    from create_superadmin import create_superadmin
+    db_session.query(User).filter(User.role == "super_admin").delete()
     db_session.commit()
+    user = create_superadmin(db_session, "Owner", "0000000009", "a-very-long-password-1")
+    assert user.role == "super_admin"
+    login = _login(str(user.id), "a-very-long-password-1", role="admin")
+    assert login.status_code == 200
+    assert login.json()["role"] == "super_admin"
+    _drop_users_by_phone(db_session, "0000000009")
+
+
+# ---- admin can delete a temporary stop change ----
+
+def _make_temp_change(db, env, status="active"):
+    custom = Stop(route_id=env["bus1"].route_id, name="TEST Custom Delete", latitude=17.981, longitude=79.531,
+                  stop_order=98, is_custom=True, is_active=True, created_by_student_id=env["student"].id)
+    db.add(custom)
+    db.commit()
+    change = TemporaryStopChange(student_id=env["student"].id, original_stop_id=env["stop_a1"].id,
+                                 temporary_stop_id=custom.id, start_date=date.today(), end_date=date.today(),
+                                 status=status, selected_address="Near the library")
+    db.add(change)
+    db.commit()
+    return change, custom
+
+
+def test_admin_deletes_live_temporary_stop_change(setup_test_environment, db_session):
+    from models import AdminActivityLog
+    env = setup_test_environment
+    change, custom = _make_temp_change(db_session, env, status="active")
+    change_id, custom_id = change.id, custom.id
+
+    resp = client.delete(f"/admin/temporary-stop-requests/{change_id}", headers=env["headers_admin"])
+    assert resp.status_code == 200, resp.text
+
+    db_session.expire_all()
+    assert db_session.query(TemporaryStopChange).filter(TemporaryStopChange.id == change_id).count() == 0
+    assert db_session.query(Stop).filter(Stop.id == custom_id).first().is_active is False
+    told = db_session.query(Notification).filter(
+        Notification.user_id == env["user_student"].id, Notification.type == "temporary_stop_removed").count()
+    assert told == 1
+    log = db_session.query(AdminActivityLog).filter(AdminActivityLog.action == "DELETE_TEMPORARY_STOP").first()
+    assert log is not None and "TEST_ROLL_101" in log.details and "Near the library" in log.details
+    # the student is back on the regular stop
+    listing = client.get("/admin/temporary-stop-requests", headers=env["headers_admin"]).json()
+    assert change_id not in [r["request_id"] for r in listing]
+
+
+def test_admin_deleting_finished_change_does_not_notify_student(setup_test_environment, db_session):
+    env = setup_test_environment
+    change, _custom = _make_temp_change(db_session, env, status="cancelled")
+    resp = client.delete(f"/admin/temporary-stop-requests/{change.id}", headers=env["headers_admin"])
+    assert resp.status_code == 200
+    told = db_session.query(Notification).filter(
+        Notification.user_id == env["user_student"].id, Notification.type == "temporary_stop_removed").count()
+    assert told == 0
+
+
+def test_delete_temporary_stop_change_access_and_missing(setup_test_environment, db_session):
+    env = setup_test_environment
+    change, _custom = _make_temp_change(db_session, env)
+    assert client.delete(f"/admin/temporary-stop-requests/{change.id}").status_code in (401, 403)
+    assert client.delete(f"/admin/temporary-stop-requests/{change.id}", headers=env["headers_student"]).status_code == 403
+    assert client.delete(f"/admin/temporary-stop-requests/{change.id}", headers=env["headers_driver"]).status_code == 403
+    assert db_session.query(TemporaryStopChange).filter(TemporaryStopChange.id == change.id).count() == 1
+    assert client.delete("/admin/temporary-stop-requests/999999", headers=env["headers_admin"]).status_code == 404
 
 
 # =====================================================================

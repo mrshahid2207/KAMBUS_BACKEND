@@ -1,4 +1,4 @@
-from pydantic import AliasChoices, BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 from datetime import date
 class LoginRequest(BaseModel):
     identifier: str
@@ -250,3 +250,14 @@ class MissedBusAllotmentRequest(BaseModel):
         if (self.latitude is None) != (self.longitude is None):
             raise ValueError("latitude and longitude must be provided together")
         return self
+
+
+class AdminCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # a stray "role" is an error, not ignored
+    name: str
+    phone: str
+    password: str
+
+
+class AdminPasswordReset(BaseModel):
+    password: str
