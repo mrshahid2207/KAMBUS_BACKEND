@@ -579,6 +579,16 @@ def _create_missed_bus_trips(db, env, passed=True, alternative_active=True, orig
             speed=20,
         ))
         db.commit()
+    if alternative_active:
+        # Replacement bus must have a GPS fix; B1 is before the student's stop on this route.
+        db.add(BusLocation(
+            bus_id=env["bus2"].id,
+            trip_id=alternative_trip.id,
+            latitude=env["stop_b1"].latitude,
+            longitude=env["stop_b1"].longitude,
+            speed=20,
+        ))
+        db.commit()
     return original_trip, alternative_trip
 
 
@@ -1167,3 +1177,106 @@ def test_admin_create_default_role_is_admin(setup_test_environment, db_session):
     # Cleanup
     db_session.query(User).filter(User.phone == test_phone).delete()
     db_session.commit()
+
+
+# =====================================================================
+# MISSED BUS: replacement bus must not have passed the stop / capacity optional
+# =====================================================================
+
+def _mock_three_route_polylines(monkeypatch, env):
+    line = [(17.980, 79.530), (17.980, 79.540)]
+    polylines = {env["bus1"].route_id: line, env["bus2"].route_id: line, env["bus3"].route_id: line}
+    monkeypatch.setattr("main.get_route_polyline_points", lambda _db, route_id: polylines.get(route_id, []))
+
+
+def _start_trip_with_gps(db, env, bus, lat=None, lng=None, speed=20):
+    trip = Trip(bus_id=bus.id, driver_id=env["driver"].id, route_id=bus.route_id,
+                status="active", started_at=datetime.utcnow())
+    db.add(trip)
+    db.commit()
+    if lat is not None:
+        db.add(BusLocation(bus_id=bus.id, trip_id=trip.id, latitude=lat, longitude=lng, speed=speed))
+        db.commit()
+    return trip
+
+
+def test_missed_bus_skips_replacement_bus_that_already_passed_stop(setup_test_environment, db_session, monkeypatch):
+    env = setup_test_environment
+    _mock_three_route_polylines(monkeypatch, env)
+    # Route 102 also runs along the student's line: X1 sits ~100 m from the student's stop A1, X2 is beyond it.
+    x1 = Stop(route_id=env["bus2"].route_id, name="TEST Stop X1", latitude=17.980, longitude=79.529, stop_order=10, is_active=True)
+    x2 = Stop(route_id=env["bus2"].route_id, name="TEST Stop X2", latitude=17.980, longitude=79.540, stop_order=11, is_active=True)
+    db_session.add_all([x1, x2])
+    db_session.commit()
+
+    original_trip = _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude)
+    # bus2 is closest/soonest but is already at X2 (past the student's stop); bus3 is farther but still before it.
+    _start_trip_with_gps(db_session, env, env["bus2"], x2.latitude, x2.longitude)
+    bus3_trip = _start_trip_with_gps(db_session, env, env["bus3"], env["stop_c1"].latitude, env["stop_c1"].longitude)
+
+    resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["alternative_bus_id"] == env["bus3"].id
+    assert resp.json()["alternative_trip_id"] == bus3_trip.id
+
+    db_session.query(Stop).filter(Stop.id.in_([x1.id, x2.id])).delete(synchronize_session=False)
+    db_session.commit()
+
+
+def test_missed_bus_rejects_when_only_candidate_already_passed_stop(setup_test_environment, db_session, monkeypatch):
+    env = setup_test_environment
+    _mock_three_route_polylines(monkeypatch, env)
+    x1 = Stop(route_id=env["bus2"].route_id, name="TEST Stop X1", latitude=17.980, longitude=79.529, stop_order=10, is_active=True)
+    x2 = Stop(route_id=env["bus2"].route_id, name="TEST Stop X2", latitude=17.980, longitude=79.540, stop_order=11, is_active=True)
+    db_session.add_all([x1, x2])
+    db_session.commit()
+
+    _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude)
+    _start_trip_with_gps(db_session, env, env["bus2"], x2.latitude, x2.longitude)
+
+    resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "No bus is currently travelling through this route."
+    assert db_session.query(MissedBusAllotment).count() == 0
+
+    db_session.query(Stop).filter(Stop.id.in_([x1.id, x2.id])).delete(synchronize_session=False)
+    db_session.commit()
+
+
+def test_missed_bus_skips_replacement_bus_without_gps(setup_test_environment, db_session, monkeypatch):
+    env = setup_test_environment
+    _mock_three_route_polylines(monkeypatch, env)
+    _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude)
+    _start_trip_with_gps(db_session, env, env["bus2"])  # active trip, no GPS fix yet
+
+    resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "No bus is currently travelling through this route."
+
+
+def test_missed_bus_capacity_is_ignored_when_not_configured(setup_test_environment, db_session, monkeypatch):
+    """Pilot behaviour: Bus has no capacity, so a bus with many registered students is still allotted."""
+    env = setup_test_environment
+    _mock_three_route_polylines(monkeypatch, env)
+    assert not hasattr(env["bus2"], "capacity")
+    _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude)
+    _start_trip_with_gps(db_session, env, env["bus2"], env["stop_b2"].latitude, env["stop_b2"].longitude)
+
+    resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["alternative_bus_id"] == env["bus2"].id
+
+
+def test_missed_bus_capacity_enforced_once_a_capacity_value_exists(setup_test_environment, db_session, monkeypatch):
+    """Future behaviour: when Bus.capacity exists, a full bus is skipped and the next bus with room is used."""
+    env = setup_test_environment
+    _mock_three_route_polylines(monkeypatch, env)
+    monkeypatch.setattr(Bus, "capacity", 1, raising=False)  # simulates the future column
+    _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude)
+    # bus2 is soonest but already has 1 registered student (student2) -> full at capacity 1
+    _start_trip_with_gps(db_session, env, env["bus2"], env["stop_b2"].latitude, env["stop_b2"].longitude)
+    _start_trip_with_gps(db_session, env, env["bus3"], env["stop_c1"].latitude, env["stop_c1"].longitude)
+
+    resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["alternative_bus_id"] == env["bus3"].id

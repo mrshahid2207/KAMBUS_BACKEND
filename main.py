@@ -448,7 +448,9 @@ def has_passed_stop(db: Session, trip: Trip, stop: Stop) -> bool:
 
     # If the target stop is a custom stop, find its nearest regular route stop as reference
     target_stop_order = stop.stop_order
-    if getattr(stop, "is_custom", False):
+    # A custom stop, or a stop that belongs to a different route than this trip,
+    # has no meaningful stop_order on this route: use its nearest stop here instead.
+    if getattr(stop, "is_custom", False) or stop.route_id != trip.route_id:
         ref_stop = None
         ref_dist = float("inf")
         for route_stop in route_stops:
@@ -2326,6 +2328,32 @@ def get_active_missed_bus_allotment(db: Session, student_id: int):
     return None
 
 
+def bus_has_capacity(db: Session, bus: Bus) -> bool:
+    """
+    Optional capacity gate for missed-bus allotment.
+
+    Bus has no `capacity` column yet, so getattr() returns None and every bus
+    is treated as having room (pilot behaviour). Once a nullable `capacity`
+    column is added to Bus, buses with a value set are enforced automatically;
+    buses with capacity left empty stay unrestricted.
+    Occupancy = registered students on the bus + active missed-bus allotments to it.
+    NFC tap-in attendance can replace this count later.
+    """
+    capacity = getattr(bus, "capacity", None)
+    if capacity is None:
+        return True
+    registered = db.query(Student).filter(Student.bus_id == bus.id).count()
+    allotted = (
+        db.query(MissedBusAllotment)
+        .filter(
+            MissedBusAllotment.alternative_bus_id == bus.id,
+            MissedBusAllotment.status == "active",
+        )
+        .count()
+    )
+    return (registered + allotted) < capacity
+
+
 def choose_alternative_bus_for_student(
     db: Session,
     student: Student,
@@ -2346,18 +2374,25 @@ def choose_alternative_bus_for_student(
         require_active_trip=True,
     )
 
-    if not candidates:
-        return None, None, None
+    # Candidates are already ordered soonest-first. Take the first one that is
+    # still going to reach the student's stop and (if capacity is set) has room.
+    for candidate in candidates:
+        bus = db.query(Bus).filter(Bus.id == candidate["bus_id"]).first()
+        if not bus:
+            continue
+        trip = get_active_trip_for_bus(db, bus.id)
+        if not trip:
+            continue
+        # No GPS yet: we cannot prove the bus hasn't passed the stop, so skip it.
+        if get_latest_location(db, bus.id, trip.id) is None:
+            continue
+        if has_passed_stop(db, trip, stop):
+            continue
+        if not bus_has_capacity(db, bus):
+            continue
+        return bus, trip, candidate.get("eta_minutes")
 
-    best_candidate = candidates[0]
-    best_bus = db.query(Bus).filter(Bus.id == best_candidate["bus_id"]).first()
-    if not best_bus:
-        return None, None, None
-
-    active_trip = get_active_trip_for_bus(db, best_bus.id)
-    eta = best_candidate.get("eta_minutes")
-
-    return best_bus, active_trip, eta
+    return None, None, None
 
 
 @app.get("/student/my-stop")
