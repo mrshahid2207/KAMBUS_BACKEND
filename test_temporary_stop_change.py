@@ -1609,3 +1609,35 @@ def test_emergency_sos_is_stored_and_reaches_student_and_admin_live(setup_test_e
     stored_admin = db_session.query(Notification).filter(
         Notification.user_id == env["user_admin"].id, Notification.type == "emergency_sos").count()
     assert stored_admin == 1
+
+
+# =====================================================================
+# SESSION LENGTH: students 7 days, drivers 1 year, admins 60 minutes
+# =====================================================================
+
+def _token_lifetime_minutes(token):
+    from jose import jwt as _jwt
+    import auth as _auth
+    exp = _jwt.decode(token, _auth.SECRET_KEY, algorithms=[_auth.ALGORITHM])["exp"]
+    import time as _time
+    return (exp - _time.time()) / 60
+
+
+def test_token_lifetime_by_role():
+    for role, expected in (("student", 7 * 24 * 60), ("driver", 365 * 24 * 60), ("admin", 60), ("super_admin", 60)):
+        minutes = _token_lifetime_minutes(create_access_token(1, role))
+        assert expected - 2 <= minutes <= expected + 1, (role, minutes)
+
+
+def test_student_login_returns_seven_day_token(setup_test_environment):
+    resp = _login("TEST_ROLL_101", "pass123")
+    assert resp.status_code == 200, resp.text
+    minutes = _token_lifetime_minutes(resp.json()["access_token"])
+    assert 7 * 24 * 60 - 2 <= minutes <= 7 * 24 * 60 + 1
+
+
+def test_driver_login_returns_one_year_token(setup_test_environment):
+    resp = client.post("/auth/login", json={"identifier": "TEST_DRV_1", "password": "pass123", "role": "driver"})
+    assert resp.status_code == 200, resp.text
+    minutes = _token_lifetime_minutes(resp.json()["access_token"])
+    assert 365 * 24 * 60 - 2 <= minutes <= 365 * 24 * 60 + 1
