@@ -404,6 +404,37 @@ def get_eta_minutes_to_stop(db: Session, bus_id: int, trip_id: int, stop: Stop):
     return max(1, int(minutes + 0.999))
 
 
+def trip_runs_in_reverse(db: Session, trip: Trip, route_stops: list, latest_order: int) -> bool:
+    """
+    True when the trip travels from the highest stop_order towards the lowest
+    (e.g. the evening run from college back to the stops).
+
+    Trips have no stored direction, so it is inferred from the trip's own GPS:
+    - if the bus has moved to a different stop than where the trip's first GPS
+      point was, the direction of that movement decides;
+    - otherwise the end of the route nearest to the first GPS point is taken as
+      the starting end (start near the highest order = reverse).
+    """
+    first = (
+        db.query(BusLocation)
+        .filter(BusLocation.bus_id == trip.bus_id, BusLocation.trip_id == trip.id)
+        .order_by(BusLocation.timestamp.asc(), BusLocation.id.asc())
+        .first()
+    )
+    if not first or not route_stops:
+        return False
+
+    first_stop = min(
+        route_stops,
+        key=lambda rs: haversine_km(first.latitude, first.longitude, rs.latitude, rs.longitude),
+    )
+    if latest_order != first_stop.stop_order:
+        return latest_order < first_stop.stop_order
+
+    orders = [rs.stop_order for rs in route_stops]
+    return (max(orders) - first_stop.stop_order) < (first_stop.stop_order - min(orders))
+
+
 def has_passed_stop(db: Session, trip: Trip, stop: Stop) -> bool:
     location = get_latest_location(db, trip.bus_id, trip.id)
     if not location:
@@ -462,6 +493,8 @@ def has_passed_stop(db: Session, trip: Trip, stop: Stop) -> bool:
         if ref_stop:
             target_stop_order = ref_stop.stop_order
 
+    if trip_runs_in_reverse(db, trip, route_stops, nearest_stop.stop_order):
+        return nearest_stop.stop_order < target_stop_order
     return nearest_stop.stop_order > target_stop_order
 
 

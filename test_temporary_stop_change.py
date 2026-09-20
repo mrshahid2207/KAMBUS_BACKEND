@@ -571,6 +571,16 @@ def _create_missed_bus_trips(db, env, passed=True, alternative_active=True, orig
     db.commit()
     if original_active:
         location_stop = env["stop_a2"] if passed else env["stop_a1"]
+        if passed:
+            # Trip direction is inferred from GPS history: the bus started at A1 and has moved on to A2.
+            db.add(BusLocation(
+                bus_id=env["bus1"].id,
+                trip_id=original_trip.id,
+                latitude=env["stop_a1"].latitude,
+                longitude=env["stop_a1"].longitude,
+                speed=20,
+                timestamp=datetime.utcnow() - timedelta(minutes=5),
+            ))
         db.add(BusLocation(
             bus_id=env["bus1"].id,
             trip_id=original_trip.id,
@@ -1189,11 +1199,16 @@ def _mock_three_route_polylines(monkeypatch, env):
     monkeypatch.setattr("main.get_route_polyline_points", lambda _db, route_id: polylines.get(route_id, []))
 
 
-def _start_trip_with_gps(db, env, bus, lat=None, lng=None, speed=20):
+def _start_trip_with_gps(db, env, bus, lat=None, lng=None, speed=20, prior=None):
     trip = Trip(bus_id=bus.id, driver_id=env["driver"].id, route_id=bus.route_id,
                 status="active", started_at=datetime.utcnow())
     db.add(trip)
     db.commit()
+    if prior is not None:
+        # earlier GPS point: shows which way the bus is travelling
+        db.add(BusLocation(bus_id=bus.id, trip_id=trip.id, latitude=prior[0], longitude=prior[1],
+                           speed=speed, timestamp=datetime.utcnow() - timedelta(minutes=5)))
+        db.commit()
     if lat is not None:
         db.add(BusLocation(bus_id=bus.id, trip_id=trip.id, latitude=lat, longitude=lng, speed=speed))
         db.commit()
@@ -1209,9 +1224,9 @@ def test_missed_bus_skips_replacement_bus_that_already_passed_stop(setup_test_en
     db_session.add_all([x1, x2])
     db_session.commit()
 
-    original_trip = _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude)
+    original_trip = _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude, prior=(env["stop_a1"].latitude, env["stop_a1"].longitude))
     # bus2 is closest/soonest but is already at X2 (past the student's stop); bus3 is farther but still before it.
-    _start_trip_with_gps(db_session, env, env["bus2"], x2.latitude, x2.longitude)
+    _start_trip_with_gps(db_session, env, env["bus2"], x2.latitude, x2.longitude, prior=(env["stop_b1"].latitude, env["stop_b1"].longitude))
     bus3_trip = _start_trip_with_gps(db_session, env, env["bus3"], env["stop_c1"].latitude, env["stop_c1"].longitude)
 
     resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
@@ -1231,8 +1246,8 @@ def test_missed_bus_rejects_when_only_candidate_already_passed_stop(setup_test_e
     db_session.add_all([x1, x2])
     db_session.commit()
 
-    _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude)
-    _start_trip_with_gps(db_session, env, env["bus2"], x2.latitude, x2.longitude)
+    _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude, prior=(env["stop_a1"].latitude, env["stop_a1"].longitude))
+    _start_trip_with_gps(db_session, env, env["bus2"], x2.latitude, x2.longitude, prior=(env["stop_b1"].latitude, env["stop_b1"].longitude))
 
     resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
     assert resp.status_code == 400
@@ -1246,7 +1261,7 @@ def test_missed_bus_rejects_when_only_candidate_already_passed_stop(setup_test_e
 def test_missed_bus_skips_replacement_bus_without_gps(setup_test_environment, db_session, monkeypatch):
     env = setup_test_environment
     _mock_three_route_polylines(monkeypatch, env)
-    _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude)
+    _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude, prior=(env["stop_a1"].latitude, env["stop_a1"].longitude))
     _start_trip_with_gps(db_session, env, env["bus2"])  # active trip, no GPS fix yet
 
     resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
@@ -1259,7 +1274,7 @@ def test_missed_bus_capacity_is_ignored_when_not_configured(setup_test_environme
     env = setup_test_environment
     _mock_three_route_polylines(monkeypatch, env)
     assert not hasattr(env["bus2"], "capacity")
-    _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude)
+    _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude, prior=(env["stop_a1"].latitude, env["stop_a1"].longitude))
     _start_trip_with_gps(db_session, env, env["bus2"], env["stop_b2"].latitude, env["stop_b2"].longitude)
 
     resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
@@ -1272,7 +1287,7 @@ def test_missed_bus_capacity_enforced_once_a_capacity_value_exists(setup_test_en
     env = setup_test_environment
     _mock_three_route_polylines(monkeypatch, env)
     monkeypatch.setattr(Bus, "capacity", 1, raising=False)  # simulates the future column
-    _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude)
+    _start_trip_with_gps(db_session, env, env["bus1"], env["stop_a2"].latitude, env["stop_a2"].longitude, prior=(env["stop_a1"].latitude, env["stop_a1"].longitude))
     # bus2 is soonest but already has 1 registered student (student2) -> full at capacity 1
     _start_trip_with_gps(db_session, env, env["bus2"], env["stop_b2"].latitude, env["stop_b2"].longitude)
     _start_trip_with_gps(db_session, env, env["bus3"], env["stop_c1"].latitude, env["stop_c1"].longitude)
@@ -1421,3 +1436,103 @@ def test_otp_correct_code_still_works_after_a_few_wrong_guesses(setup_test_envir
     assert ok.status_code == 200, ok.text
     assert ok.json()["success"] is True
     _cleanup_otp_user(db_session)
+
+
+# =====================================================================
+# TRIP DIRECTION: evening runs travel the route in reverse stop_order
+# =====================================================================
+
+def _direction_setup(db, env, points):
+    """Add stop A3 (order 3) to route 101 and start a bus-1 trip with GPS points [(stop, minutes_ago), ...]."""
+    a3 = Stop(route_id=env["bus1"].route_id, name="TEST Stop A3", latitude=17.980, longitude=79.550,
+              stop_order=3, is_active=True)
+    db.add(a3)
+    db.commit()
+    trip = Trip(bus_id=env["bus1"].id, driver_id=env["driver"].id, route_id=env["bus1"].route_id,
+                status="active", started_at=datetime.utcnow())
+    db.add(trip)
+    db.commit()
+    stops = {"A1": env["stop_a1"], "A2": env["stop_a2"], "A3": a3}
+    for name, minutes_ago in points:
+        db.add(BusLocation(bus_id=env["bus1"].id, trip_id=trip.id, latitude=stops[name].latitude,
+                           longitude=stops[name].longitude, speed=20,
+                           timestamp=datetime.utcnow() - timedelta(minutes=minutes_ago)))
+    db.commit()
+    return trip, stops
+
+
+def _drop_stop(db, stop):
+    db.query(Stop).filter(Stop.id == stop.id).delete()
+    db.commit()
+
+
+def test_has_passed_stop_forward_trip(setup_test_environment, db_session):
+    from main import has_passed_stop
+    env = setup_test_environment
+    trip, stops = _direction_setup(db_session, env, [("A1", 10), ("A2", 1)])
+    assert has_passed_stop(db_session, trip, stops["A1"]) is True
+    assert has_passed_stop(db_session, trip, stops["A3"]) is False
+    _drop_stop(db_session, stops["A3"])
+
+
+def test_has_passed_stop_reverse_evening_trip_after_movement(setup_test_environment, db_session):
+    from main import has_passed_stop
+    env = setup_test_environment
+    trip, stops = _direction_setup(db_session, env, [("A3", 10), ("A2", 1)])
+    assert has_passed_stop(db_session, trip, stops["A3"]) is True    # already left A3
+    assert has_passed_stop(db_session, trip, stops["A1"]) is False   # still on its way to A1
+    _drop_stop(db_session, stops["A3"])
+
+
+def test_has_passed_stop_reverse_trip_that_has_just_started(setup_test_environment, db_session):
+    from main import has_passed_stop
+    env = setup_test_environment
+    trip, stops = _direction_setup(db_session, env, [("A3", 1)])  # single point at the far end = trip started there
+    assert has_passed_stop(db_session, trip, stops["A1"]) is False
+    assert has_passed_stop(db_session, trip, stops["A3"]) is False
+    _drop_stop(db_session, stops["A3"])
+
+
+def test_has_passed_stop_forward_trip_that_has_just_started(setup_test_environment, db_session):
+    from main import has_passed_stop
+    env = setup_test_environment
+    trip, stops = _direction_setup(db_session, env, [("A1", 1)])
+    assert has_passed_stop(db_session, trip, stops["A3"]) is False
+    _drop_stop(db_session, stops["A3"])
+
+
+def test_has_passed_stop_trip_started_mid_route_uses_movement(setup_test_environment, db_session):
+    from main import has_passed_stop
+    env = setup_test_environment
+    trip, stops = _direction_setup(db_session, env, [("A2", 10), ("A3", 1)])  # started at A2, moving up
+    assert has_passed_stop(db_session, trip, stops["A1"]) is True
+    assert has_passed_stop(db_session, trip, stops["A2"]) is True
+    assert has_passed_stop(db_session, trip, stops["A3"]) is False
+    _drop_stop(db_session, stops["A3"])
+
+
+def test_missed_bus_evening_trip_not_yet_at_students_stop(setup_test_environment, db_session, monkeypatch):
+    env = setup_test_environment
+    _mock_three_route_polylines(monkeypatch, env)
+    trip, stops = _direction_setup(db_session, env, [("A3", 10), ("A2", 1)])
+    _start_trip_with_gps(db_session, env, env["bus2"], env["stop_b1"].latitude, env["stop_b1"].longitude)
+    # student's stop is A1: the evening bus (A3 -> A2 -> A1) has not reached it yet
+    resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert resp.status_code == 400
+    assert "not reached" in resp.json()["detail"]
+    _drop_stop(db_session, stops["A3"])
+
+
+def test_missed_bus_evening_trip_after_students_stop(setup_test_environment, db_session, monkeypatch):
+    env = setup_test_environment
+    # replacement route's road line must reach stop A3 (79.550) for it to count as passing through
+    line = [(17.980, 79.530), (17.980, 79.555)]
+    monkeypatch.setattr("main.get_route_polyline_points", lambda _db, route_id: line)
+    trip, stops = _direction_setup(db_session, env, [("A3", 10), ("A2", 1)])
+    env["student"].stop_id = stops["A3"].id  # the evening bus left A3 first, so this student has missed it
+    db_session.commit()
+    _start_trip_with_gps(db_session, env, env["bus2"], env["stop_b1"].latitude, env["stop_b1"].longitude)
+    resp = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["alternative_bus_id"] == env["bus2"].id
+    _drop_stop(db_session, stops["A3"])
