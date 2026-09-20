@@ -80,8 +80,11 @@ security = HTTPBearer()
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
+    return get_user_from_token(credentials.credentials)
 
-    token = credentials.credentials
+
+def get_user_from_token(token: str):
+    """Decode a bearer token string. Shared by HTTP requests and the websocket."""
 
     try:
 

@@ -1536,3 +1536,76 @@ def test_missed_bus_evening_trip_after_students_stop(setup_test_environment, db_
     assert resp.status_code == 200, resp.text
     assert resp.json()["alternative_bus_id"] == env["bus2"].id
     _drop_stop(db_session, stops["A3"])
+
+
+# =====================================================================
+# REAL-TIME: websocket auth, and SOS / detour alerts (endpoint + live delivery)
+# =====================================================================
+
+def _ws_receive_json(ws, seconds=6):
+    """Wait for one message without hanging the suite if nothing arrives."""
+    import threading
+    box = {}
+
+    def run():
+        try:
+            box["msg"] = ws.receive_json()
+        except Exception as exc:  # noqa: BLE001
+            box["err"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    return box.get("msg")
+
+
+def test_websocket_rejects_missing_and_invalid_token(setup_test_environment):
+    from starlette.websockets import WebSocketDisconnect
+    for url in ("/ws/notifications", "/ws/notifications?token=not-a-real-token"):
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(url) as ws:
+                ws.receive_text()
+
+
+def test_websocket_accepts_valid_token_and_answers_ping(setup_test_environment):
+    env = setup_test_environment
+    with client.websocket_connect(f"/ws/notifications?token={env['token_student']}") as ws:
+        ws.send_text("ping")
+        assert ws.receive_text() == "pong"
+
+
+def test_detour_alert_is_stored_and_reaches_student_live(setup_test_environment, db_session):
+    import main as _main
+    from starlette.testclient import TestClient
+    env = setup_test_environment
+    with TestClient(_main.app) as live:
+        with live.websocket_connect(f"/ws/notifications?token={env['token_student']}") as ws:
+            resp = live.post("/driver/report-detour", json={"reason": "Road Work", "delay_minutes": 10},
+                             headers=env["headers_driver"])
+            assert resp.status_code == 200, resp.text
+            msg = _ws_receive_json(ws)
+    assert msg is not None and msg["type"] == "detour_alert"
+    assert msg["bus_id"] == env["bus1"].id
+    stored = db_session.query(Notification).filter(
+        Notification.user_id == env["user_student"].id, Notification.type == "detour_alert").count()
+    assert stored == 1
+
+
+def test_emergency_sos_is_stored_and_reaches_student_and_admin_live(setup_test_environment, db_session):
+    import main as _main
+    from starlette.testclient import TestClient
+    env = setup_test_environment
+    admin_token = create_access_token(env["user_admin"].id, "admin")
+    with TestClient(_main.app) as live:
+        with live.websocket_connect(f"/ws/notifications?token={env['token_student']}") as student_ws, \
+                live.websocket_connect(f"/ws/notifications?token={admin_token}") as admin_ws:
+            resp = live.post("/driver/emergency-sos", json={"incident_type": "Breakdown"},
+                             headers=env["headers_driver"])
+            assert resp.status_code == 200, resp.text
+            student_msg = _ws_receive_json(student_ws)
+            admin_msg = _ws_receive_json(admin_ws)
+    assert student_msg is not None and student_msg["type"] == "emergency_sos"
+    assert admin_msg is not None and admin_msg["type"] == "emergency_sos"
+    stored_admin = db_session.query(Notification).filter(
+        Notification.user_id == env["user_admin"].id, Notification.type == "emergency_sos").count()
+    assert stored_admin == 1

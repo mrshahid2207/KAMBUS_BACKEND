@@ -87,6 +87,7 @@ from auth import (
     verify_password,
     create_access_token,
     get_current_user,
+    get_user_from_token,
     require_driver,
     require_admin,
     require_super_admin,
@@ -124,9 +125,12 @@ class NotificationConnectionManager:
     def __init__(self):
         # user_id -> set of active WebSockets
         self.active_connections: dict[int, set[WebSocket]] = {}
+        # Event loop the sockets live on; needed to push from sync endpoint threads
+        self.loop: asyncio.AbstractEventLoop | None = None
 
     async def connect(self, user_id: int, websocket: WebSocket):
         await websocket.accept()
+        self.loop = asyncio.get_running_loop()
         if user_id not in self.active_connections:
             self.active_connections[user_id] = set()
         self.active_connections[user_id].add(websocket)
@@ -154,11 +158,18 @@ class NotificationConnectionManager:
 
     def push_notification_sync(self, user_id: int, message: dict):
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(self.send_personal_message(message, user_id))
+            loop = self.loop
+            if loop is None or loop.is_closed():
+                return  # no socket has ever connected; the stored notification is the fallback
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is loop:
+                loop.create_task(self.send_personal_message(message, user_id))
             else:
-                loop.run_until_complete(self.send_personal_message(message, user_id))
+                # Called from a sync endpoint's worker thread: hand the send to the socket's loop
+                asyncio.run_coroutine_threadsafe(self.send_personal_message(message, user_id), loop)
         except Exception as e:
             logger.warning(f"Realtime push error for user {user_id}: {e}")
 
@@ -174,16 +185,12 @@ async def websocket_notifications(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    db = SessionLocal()
     try:
-        user_payload = get_current_user(token=token, db=db)
+        user_payload = get_user_from_token(token)
         user_id = user_payload["user_id"]
     except Exception:
-        db.close()
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
-    finally:
-        db.close()
 
     await notification_manager.connect(user_id, websocket)
 
@@ -5877,7 +5884,7 @@ def report_driver_detour(
             notification_type="detour_alert",
             related_bus_id=bus.id,
             related_trip_id=active_trip.id if active_trip else None,
-            payload=json.dumps({"reason": reason, "delay_minutes": delay, "bus_number": bus.bus_number})
+            data={"reason": reason, "delay_minutes": delay, "bus_number": bus.bus_number}
         )
         try:
             notification_manager.push_notification_sync(st.user_id, {
@@ -5902,7 +5909,7 @@ def report_driver_detour(
             notification_type="detour_alert",
             related_bus_id=bus.id,
             related_trip_id=active_trip.id if active_trip else None,
-            payload=json.dumps({"reason": reason, "delay_minutes": delay, "bus_number": bus.bus_number})
+            data={"reason": reason, "delay_minutes": delay, "bus_number": bus.bus_number}
         )
         try:
             notification_manager.push_notification_sync(adm.id, {
@@ -5967,7 +5974,7 @@ def report_driver_emergency_sos(
             notification_type="emergency_sos",
             related_bus_id=bus.id,
             related_trip_id=active_trip.id if active_trip else None,
-            payload=json.dumps({"incident": incident, "bus_number": bus.bus_number})
+            data={"incident": incident, "bus_number": bus.bus_number}
         )
         try:
             notification_manager.push_notification_sync(st.user_id, {
@@ -5990,7 +5997,7 @@ def report_driver_emergency_sos(
             notification_type="emergency_sos",
             related_bus_id=bus.id,
             related_trip_id=active_trip.id if active_trip else None,
-            payload=json.dumps({
+            data={
                 "incident": incident,
                 "bus_id": bus.id,
                 "bus_number": bus.bus_number,
@@ -5998,7 +6005,7 @@ def report_driver_emergency_sos(
                 "driver_phone": driver_phone,
                 "latitude": data.latitude or (location.latitude if location else None),
                 "longitude": data.longitude or (location.longitude if location else None)
-            })
+            }
         )
         try:
             notification_manager.push_notification_sync(adm.id, {
