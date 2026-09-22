@@ -513,7 +513,7 @@ def active_student_request_exists(db: Session, student_id: int, trip_id: int) ->
         .filter(
             WaitRequest.student_id == student_id,
             WaitRequest.trip_id == trip_id,
-            WaitRequest.status.in_(["pending", "accepted"])
+            WaitRequest.status.in_(["pending", "accepted", "waiting"])
         )
         .first()
     )
@@ -561,6 +561,71 @@ def active_skip_cooldown(db: Session, student_id: int, trip_id: int) -> bool:
         .first()
     )
     return request is not None
+
+
+WAIT_STOP_ARRIVAL_RADIUS_M = 75.0
+
+
+def is_at_stop(bus_lat: float, bus_lng: float, stop_lat: float, stop_lng: float, radius_m: float = WAIT_STOP_ARRIVAL_RADIUS_M) -> bool:
+    if bus_lat is None or bus_lng is None or stop_lat is None or stop_lng is None:
+        return False
+    return (haversine_km(bus_lat, bus_lng, stop_lat, stop_lng) * 1000.0) <= radius_m
+
+
+def maybe_start_wait_countdown(db: Session, trip: Trip, bus_lat: float, bus_lng: float) -> None:
+    if not trip or bus_lat is None or bus_lng is None:
+        return
+
+    accepted_requests = (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.trip_id == trip.id,
+            WaitRequest.status == "accepted"
+        )
+        .all()
+    )
+    if not accepted_requests:
+        return
+
+    by_stop: dict[int, list[WaitRequest]] = {}
+    for r in accepted_requests:
+        if r.stop_id is not None:
+            by_stop.setdefault(r.stop_id, []).append(r)
+
+    changed = False
+    now = datetime.utcnow()
+    for stop_id, group in by_stop.items():
+        stop = db.query(Stop).filter(Stop.id == stop_id).first()
+        if not stop:
+            continue
+        if is_at_stop(bus_lat, bus_lng, stop.latitude, stop.longitude):
+            minutes = max(r.minutes for r in group)
+            for r in group:
+                r.status = "waiting"
+                r.wait_until = now + timedelta(minutes=minutes)
+                student = db.query(Student).filter(Student.id == r.student_id).first()
+                if student:
+                    send_notification(
+                        db,
+                        student.user_id,
+                        "Bus Arrived at Stop",
+                        f"Your bus has arrived at {stop.name}. The {minutes}-minute wait countdown has started.",
+                        "wait_started",
+                        {
+                            "wait_request_id": r.id,
+                            "trip_id": trip.id,
+                            "stop_id": stop.id,
+                            "minutes": minutes,
+                            "wait_until": to_utc_iso(r.wait_until),
+                        },
+                        related_bus_id=trip.bus_id,
+                        related_trip_id=trip.id,
+                        related_wait_request_id=r.id,
+                    )
+            changed = True
+
+    if changed:
+        db.commit()
 
 
 @app.get("/")
@@ -1501,6 +1566,8 @@ def update_bus_location(
     db.commit()
     db.refresh(location)
 
+    maybe_start_wait_countdown(db, active_trip, location.latitude, location.longitude)
+
     lat_delta = radians(COLLEGE_LAT - location.latitude)
     lng_delta = radians(COLLEGE_LNG - location.longitude)
     a = sin(lat_delta / 2) ** 2 + cos(radians(location.latitude)) * cos(radians(COLLEGE_LAT)) * sin(lng_delta / 2) ** 2
@@ -1625,6 +1692,7 @@ def get_bus_location(
             "is_waiting": False,
             "wait_remaining_seconds": None,
             "wait_stop_id": None,
+            "wait_stop_name": None,
             "wait_minutes": None
         }
 
@@ -1656,6 +1724,7 @@ def get_bus_location(
             "is_waiting": False,
             "wait_remaining_seconds": None,
             "wait_stop_id": None,
+            "wait_stop_name": None,
             "wait_minutes": None
         }
 
@@ -1664,7 +1733,7 @@ def get_bus_location(
         .filter(
             WaitRequest.trip_id == active_trip.id,
             WaitRequest.bus_id == bus_id,
-            WaitRequest.status == "accepted",
+            WaitRequest.status == "waiting",
             WaitRequest.wait_until.isnot(None),
             WaitRequest.wait_until > datetime.utcnow()
         )
@@ -1674,12 +1743,15 @@ def get_bus_location(
 
     wait_remaining_seconds = None
     wait_stop_id = None
+    wait_stop_name = None
     wait_minutes = None
 
     if active_wait:
         wait_remaining_seconds = max(0, int((active_wait.wait_until - datetime.utcnow()).total_seconds()))
         wait_stop_id = active_wait.stop_id
         wait_minutes = active_wait.minutes
+        w_stop = db.query(Stop).filter(Stop.id == active_wait.stop_id).first() if active_wait.stop_id else None
+        wait_stop_name = w_stop.name if w_stop else None
 
     return {
         "bus_id": bus_id,
@@ -1694,6 +1766,7 @@ def get_bus_location(
         "is_waiting": active_wait is not None,
         "wait_remaining_seconds": wait_remaining_seconds,
         "wait_stop_id": wait_stop_id,
+        "wait_stop_name": wait_stop_name,
         "wait_minutes": wait_minutes
     }
 
@@ -3343,7 +3416,7 @@ def get_wait_request_status(
         db.refresh(wait_request)
 
     if (
-        wait_request.status == "accepted"
+        wait_request.status in ("accepted", "waiting")
         and wait_request.wait_until is not None
         and wait_request.wait_until <= datetime.utcnow()
     ):
@@ -3351,17 +3424,21 @@ def get_wait_request_status(
         db.commit()
         db.refresh(wait_request)
 
+    w_stop = db.query(Stop).filter(Stop.id == wait_request.stop_id).first() if wait_request.stop_id else None
+
     return {
         "request_id": wait_request.id,
         "student_id": wait_request.student_id,
         "bus_id": wait_request.bus_id,
         "trip_id": wait_request.trip_id,
         "stop_id": wait_request.stop_id,
+        "stop_name": w_stop.name if w_stop else None,
         "minutes": wait_request.minutes,
         "status": wait_request.status,
         "created_at": to_utc_iso(wait_request.created_at),
         "auto_accept_at": to_utc_iso(wait_request.auto_accept_at),
         "wait_until": to_utc_iso(wait_request.wait_until),
+        "wait_remaining_seconds": max(0, int((wait_request.wait_until - datetime.utcnow()).total_seconds())) if (wait_request.status == "waiting" and wait_request.wait_until) else None,
         "skipped_at": to_utc_iso(wait_request.skipped_at),
         "cooldown_until": to_utc_iso(wait_request.cooldown_until)
     }
@@ -3459,20 +3536,19 @@ def get_driver_wait_requests(
             continue
 
         trip.wait_budget_used += requested_minutes
-        wait_until = now + timedelta(minutes=requested_minutes)
 
         for request in group:
             request.status = "accepted"
-            request.wait_until = wait_until
+            request.wait_until = None
             student = db.query(Student).filter(Student.id == request.student_id).first()
             if student:
                 send_notification(
                     db,
                     student.user_id,
                     "Wait Request Accepted",
-                    f"The bus will wait approximately {requested_minutes} minute{'s' if requested_minutes != 1 else ''} at {stop.name}.",
+                    f"The driver accepted your wait request. The bus will wait up to {requested_minutes} minute{'s' if requested_minutes != 1 else ''} upon arrival at {stop.name}.",
                     "wait_accepted",
-                    {"wait_request_id": request.id, "trip_id": trip.id, "stop_id": stop.id, "minutes": requested_minutes, "wait_until": to_utc_iso(wait_until)},
+                    {"wait_request_id": request.id, "trip_id": trip.id, "stop_id": stop.id, "minutes": requested_minutes},
                     related_bus_id=bus.id,
                     related_trip_id=trip.id,
                     related_wait_request_id=request.id
@@ -3480,34 +3556,53 @@ def get_driver_wait_requests(
 
     db.commit()
 
-    pending_requests = (
+    latest_loc = get_latest_location(db, bus.id, trip.id)
+    if latest_loc:
+        maybe_start_wait_countdown(db, trip, latest_loc.latitude, latest_loc.longitude)
+
+    expired_waiting = (
         db.query(WaitRequest)
         .filter(
             WaitRequest.bus_id == bus.id,
             WaitRequest.trip_id == trip.id,
-            WaitRequest.status == "pending"
+            WaitRequest.status == "waiting",
+            WaitRequest.wait_until.isnot(None),
+            WaitRequest.wait_until <= now
+        )
+        .all()
+    )
+    if expired_waiting:
+        for exp_r in expired_waiting:
+            exp_r.status = "completed"
+        db.commit()
+
+    active_requests = (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.bus_id == bus.id,
+            WaitRequest.trip_id == trip.id,
+            WaitRequest.status.in_(["pending", "accepted", "waiting"])
         )
         .order_by(WaitRequest.created_at.asc())
         .all()
     )
 
     grouped = {}
-    for request in pending_requests:
+    for request in active_requests:
         if request.stop_id is None:
             continue
-        key = (request.trip_id, request.stop_id)
+        key = (request.trip_id, request.stop_id, request.status)
         grouped.setdefault(key, []).append(request)
 
     result = []
     for key, group in grouped.items():
         stop_id = key[1]
+        group_status = key[2]
         stop = db.query(Stop).filter(Stop.id == stop_id).first()
         if not stop:
             continue
 
         requested_minutes = max(r.minutes for r in group)
-        earliest_deadline = min((r.auto_accept_at for r in group if r.auto_accept_at), default=None)
-
         students = []
         for request in group:
             student = db.query(Student).filter(Student.id == request.student_id).first()
@@ -3517,16 +3612,26 @@ def get_driver_wait_requests(
                 "roll_number": student.roll_number if student else None
             })
 
-        result.append({
+        entry = {
             "trip_id": trip.id,
             "stop_id": stop.id,
             "stop_name": stop.name,
             "student_count": len(group),
             "minutes": requested_minutes,
-            "auto_accept_at": earliest_deadline,
-            "action": "skip_only",
+            "status": group_status,
             "students": students
-        })
+        }
+
+        if group_status == "pending":
+            entry["auto_accept_at"] = min((r.auto_accept_at for r in group if r.auto_accept_at), default=None)
+            entry["action"] = "skip_only"
+        elif group_status == "waiting":
+            group_wait_until = max((r.wait_until for r in group if r.wait_until), default=None)
+            if group_wait_until:
+                entry["wait_until"] = to_utc_iso(group_wait_until)
+                entry["wait_remaining_seconds"] = max(0, int((group_wait_until - now).total_seconds()))
+
+        result.append(entry)
 
     return {
         "bus_id": bus.id,
@@ -3564,7 +3669,16 @@ def accept_wait_request(
     if request.status != "pending":
         raise HTTPException(status_code=400, detail="Request is no longer pending")
 
-    request.status = "accepted"
+    trip = db.query(Trip).filter(Trip.id == request.trip_id).with_for_update().first()
+    if not trip:
+        raise HTTPException(status_code=400, detail="No active trip associated with this request")
+
+    remaining_budget = trip.wait_budget_total - trip.wait_budget_used
+    if request.minutes > remaining_budget:
+        raise HTTPException(status_code=400, detail="Insufficient remaining wait budget")
+
+    trip.wait_budget_used += request.minutes   # reserve budget now, not at arrival
+    request.status = "accepted"                # NOT "waiting" yet — bus hasn't arrived
     db.commit()
     db.refresh(request)
 
@@ -3574,9 +3688,9 @@ def accept_wait_request(
             db,
             student.user_id,
             "Wait Request Accepted",
-            "Your driver has accepted your wait request.",
+            "Your driver has accepted your wait request. The bus will wait upon arrival.",
             "wait_accepted",
-            {"wait_request_id": request.id},
+            {"wait_request_id": request.id, "trip_id": request.trip_id},
             related_bus_id=request.bus_id,
             related_wait_request_id=request.id
         )
@@ -3638,6 +3752,86 @@ def reject_wait_request(
         "request_id": request.id,
         "status": request.status
     }
+
+
+@app.post("/student/wait-request/{request_id}/board")
+def confirm_boarded(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_student: dict = Depends(require_student)
+):
+    student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student profile not found")
+
+    request = db.query(WaitRequest).filter(
+        WaitRequest.id == request_id,
+        WaitRequest.student_id == student.id
+    ).first()
+    if not request:
+        raise HTTPException(status_code=404, detail="Wait request not found")
+
+    if request.status != "waiting":
+        raise HTTPException(status_code=400, detail="Wait is not currently active")
+
+    request.status = "completed"
+    request.wait_until = datetime.utcnow()
+    db.commit()
+
+    # notify driver so their countdown UI clears immediately
+    bus = db.query(Bus).filter(Bus.id == request.bus_id).first()
+    driver = db.query(Driver).filter(Driver.id == bus.driver_id).first() if bus and bus.driver_id else None
+    if driver:
+        send_notification(
+            db, driver.user_id, "Passenger boarded", "You can go now.",
+            "wait_request_boarded", {"wait_request_id": request.id, "trip_id": request.trip_id},
+            related_bus_id=bus.id, related_trip_id=request.trip_id
+        )
+    db.commit()
+    return {"status": "completed"}
+
+
+@app.post("/student/wait-request/{request_id}/cancel")
+def cancel_wait_request(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_student: dict = Depends(require_student)
+):
+    student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student profile not found")
+
+    request = db.query(WaitRequest).filter(
+        WaitRequest.id == request_id,
+        WaitRequest.student_id == student.id
+    ).first()
+    if not request:
+        raise HTTPException(status_code=404, detail="Wait request not found")
+
+    if request.status not in ("pending", "accepted", "waiting"):
+        raise HTTPException(status_code=400, detail="Request cannot be cancelled")
+
+    trip = db.query(Trip).filter(Trip.id == request.trip_id).with_for_update().first()
+    if request.status in ("accepted", "waiting") and trip:
+        other_active_at_stop = db.query(WaitRequest).filter(
+            WaitRequest.trip_id == trip.id,
+            WaitRequest.stop_id == request.stop_id,
+            WaitRequest.id != request.id,
+            WaitRequest.status.in_(["accepted", "waiting"])
+        ).all()
+        if not other_active_at_stop:
+            trip.wait_budget_used = max(0, trip.wait_budget_used - request.minutes)
+        else:
+            old_group_max = max(r.minutes for r in other_active_at_stop + [request])
+            new_group_max = max(r.minutes for r in other_active_at_stop)
+            diff = max(0, old_group_max - new_group_max)
+            if diff > 0:
+                trip.wait_budget_used = max(0, trip.wait_budget_used - diff)
+
+    request.status = "rejected"
+    db.commit()
+    return {"status": "rejected"}
+
 
 @app.get("/driver/route-stops")
 def get_driver_route_stops(
@@ -5665,6 +5859,19 @@ def end_driver_trip(
 
     trip.ended_at = datetime.utcnow()
     trip.status = "completed"
+
+    open_requests = db.query(WaitRequest).filter(
+        WaitRequest.trip_id == trip.id,
+        WaitRequest.status.in_(["pending", "accepted", "waiting"])
+    ).all()
+    now = datetime.utcnow()
+    for r in open_requests:
+        if r.status == "waiting":
+            r.status = "completed"
+            r.wait_until = min(r.wait_until, now) if r.wait_until else now
+        else:
+            r.status = "rejected"
+
     db.commit()
     db.refresh(trip)
 
@@ -5884,25 +6091,43 @@ def reconcile_wait_requests(db: Session, trip: Trip):
             continue
 
         trip.wait_budget_used += requested_minutes
-        wait_until = now + timedelta(minutes=requested_minutes)
 
         for request in group:
             request.status = "accepted"
-            request.wait_until = wait_until
+            request.wait_until = None
             student = db.query(Student).filter(Student.id == request.student_id).first()
             if student:
                 send_notification(
                     db,
                     student.user_id,
                     "Wait Request Accepted",
-                    f"The bus will wait approximately {requested_minutes} minute{'s' if requested_minutes != 1 else ''} at {stop.name}.",
+                    f"The driver accepted your wait request. The bus will wait up to {requested_minutes} minute{'s' if requested_minutes != 1 else ''} upon arrival at {stop.name}.",
                     "wait_accepted",
-                    {"wait_request_id": request.id, "trip_id": trip.id, "stop_id": request.stop_id, "minutes": requested_minutes, "wait_until": to_utc_iso(wait_until)},
+                    {"wait_request_id": request.id, "trip_id": trip.id, "stop_id": request.stop_id, "minutes": requested_minutes},
                     related_bus_id=trip.bus_id,
                     related_trip_id=trip.id,
                     related_wait_request_id=request.id
                 )
             changed = True
+
+    latest_loc = get_latest_location(db, trip.bus_id, trip.id)
+    if latest_loc:
+        maybe_start_wait_countdown(db, trip, latest_loc.latitude, latest_loc.longitude)
+
+    expired_waiting = (
+        db.query(WaitRequest)
+        .filter(
+            WaitRequest.trip_id == trip.id,
+            WaitRequest.status == "waiting",
+            WaitRequest.wait_until.isnot(None),
+            WaitRequest.wait_until <= now
+        )
+        .all()
+    )
+    if expired_waiting:
+        for exp_r in expired_waiting:
+            exp_r.status = "completed"
+        changed = True
 
     if changed:
         db.commit()
