@@ -4631,6 +4631,7 @@ def admin_update_student(
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
     user = db.query(User).filter(User.id == student.user_id).first()
+    old_bus_id, old_stop_id = student.bus_id, student.stop_id
 
     if data.name:
         user.name = data.name
@@ -4655,6 +4656,7 @@ def admin_update_student(
             raise HTTPException(status_code=404, detail="Stop not found")
         student.stop_id = data.stop_id if data.stop_id != 0 else None
 
+    notify_assignment_change(db, student, old_bus_id, old_stop_id)
     db.commit()
     db.refresh(student)
     log_admin_activity(db, current_user["user_id"], "UPDATE_STUDENT", "student", str(student.id), f"Updated student {student.roll_number}")
@@ -4677,6 +4679,23 @@ def admin_delete_student(student_id: int, db: Session = Depends(get_db), current
     return {"message": f"Student {roll} deleted successfully", "student_id": student_id}
 
 
+def notify_assignment_change(db, student, old_bus_id, old_stop_id):
+    if not student.user_id:
+        return
+    if student.bus_id != old_bus_id:
+        bus = db.query(Bus).filter(Bus.id == student.bus_id).first() if student.bus_id else None
+        msg = f"Your bus has been changed to {bus.bus_number}." if bus else "The transport office removed your bus assignment."
+        if bus and student.stop_id is None:
+            msg += " Please select your stop again."
+        send_notification(db, student.user_id, "Bus Changed", msg, "bus_changed",
+                          {"bus_id": student.bus_id}, related_bus_id=student.bus_id)
+    elif student.stop_id != old_stop_id:
+        stop = db.query(Stop).filter(Stop.id == student.stop_id).first() if student.stop_id else None
+        msg = f"Your stop has been changed to {stop.name}." if stop else "The transport office removed your stop. Please select your stop."
+        send_notification(db, student.user_id, "Stop Changed", msg, "stop_changed",
+                          {"stop_id": student.stop_id})
+
+
 @app.patch("/admin/students/{student_id}/bus")
 def admin_assign_student_bus(
     student_id: int,
@@ -4690,12 +4709,14 @@ def admin_assign_student_bus(
     if data.bus_id is not None and not db.query(Bus).filter(Bus.id == data.bus_id).first():
         raise HTTPException(status_code=404, detail="Bus not found")
 
+    old_bus_id, old_stop_id = student.bus_id, student.stop_id
     student.bus_id = data.bus_id
     if student.stop_id is not None and data.bus_id is not None:
         stop = db.query(Stop).filter(Stop.id == student.stop_id).first()
         bus = db.query(Bus).filter(Bus.id == data.bus_id).first()
         if not stop or not bus or stop.route_id != bus.route_id:
             student.stop_id = None
+    notify_assignment_change(db, student, old_bus_id, old_stop_id)
     db.commit()
     log_admin_activity(db, current_user["user_id"], "ASSIGN_STUDENT_BUS", "student", str(student.id), f"Assigned student {student.roll_number} to Bus ID {data.bus_id}")
     return {"message": "Student bus assignment updated", "student_id": student.id, "bus_id": student.bus_id}
@@ -4711,6 +4732,7 @@ def admin_assign_student_stop(
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student profile not found")
+    old_bus_id, old_stop_id = student.bus_id, student.stop_id
     if data.stop_id is None:
         student.stop_id = None
     else:
@@ -4721,6 +4743,7 @@ def admin_assign_student_stop(
         if not bus or bus.route_id != stop.route_id:
             raise HTTPException(status_code=400, detail="Stop must belong to the student's assigned bus route")
         student.stop_id = stop.id
+    notify_assignment_change(db, student, old_bus_id, old_stop_id)
     db.commit()
     log_admin_activity(db, current_user["user_id"], "ASSIGN_STUDENT_STOP", "student", str(student.id), f"Assigned student {student.roll_number} to Stop ID {data.stop_id}")
     return {"message": "Student stop assignment updated", "student_id": student.id, "stop_id": student.stop_id}
