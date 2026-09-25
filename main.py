@@ -11,6 +11,12 @@ import hashlib
 import hmac
 import urllib.request
 import urllib.parse
+import os
+import secrets
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
 
 from database import Base, engine, SessionLocal
 from models import (
@@ -115,7 +121,45 @@ ALLOWED_COMPLAINT_REASONS = [
 COMPLAINT_MIN_VOTES = 2
 COMPLAINT_MIN_YES_RATIO = 0.6  # 60% of respondents must vote yes
 
-app = FastAPI(title="KAMBUS API")
+app = FastAPI(
+    title="KAMBUS API",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
+)
+
+docs_security = HTTPBasic()
+
+
+def require_docs_auth(credentials: HTTPBasicCredentials = Depends(docs_security)):
+    docs_user = os.getenv("DOCS_USER", "")
+    docs_pass = os.getenv("DOCS_PASS", "")
+    if not docs_user or not docs_pass:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    is_user_ok = secrets.compare_digest(credentials.username.encode("utf-8"), docs_user.encode("utf-8"))
+    is_pass_ok = secrets.compare_digest(credentials.password.encode("utf-8"), docs_pass.encode("utf-8"))
+    if not (is_user_ok and is_pass_ok):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+
+@app.get("/docs", include_in_schema=False)
+def get_documentation(_: str = Depends(require_docs_auth)):
+    return get_swagger_ui_html(openapi_url="/openapi.json", title=f"{app.title} - Swagger UI")
+
+
+@app.get("/openapi.json", include_in_schema=False)
+def openapi(_: str = Depends(require_docs_auth)):
+    return JSONResponse(get_openapi(title=app.title, version=app.version, routes=app.routes))
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -630,7 +674,7 @@ def maybe_start_wait_countdown(db: Session, trip: Trip, bus_lat: float, bus_lng:
 
 @app.get("/")
 def root():
-    return {"message": "KAMBUS Backend is running 🚍"}
+    return {"status": "ok"}
 
 
 @app.get("/health")

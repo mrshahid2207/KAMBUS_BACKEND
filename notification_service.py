@@ -41,8 +41,18 @@ def send_notification(db: Session, user_id: int, title: str, message: str,
         return notification
     for device in db.query(DeviceToken).filter(DeviceToken.user_id == user_id, DeviceToken.is_active == 1).all():
         try:
-            messaging.send(messaging.Message(notification=messaging.Notification(title=title, body=message),
-                data={str(k): str(v) for k, v in (data or {}).items()}, token=device.token))
+            message_id = messaging.send(messaging.Message(
+                notification=messaging.Notification(title=title, body=message),
+                data={str(k): str(v) for k, v in (data or {}).items()},
+                token=device.token,
+            ))
+            # Log the row ID, not the FCM token itself, because FCM tokens are credentials.
+            log.info(
+                "FCM send succeeded: user_id=%s device_token_id=%s message_id=%s",
+                user_id,
+                device.id,
+                message_id,
+            )
         except Exception:
             # Invalid tokens must never break the business action that triggered a notification.
             log.exception("FCM send failed for device token %s", device.id)
