@@ -15,6 +15,11 @@ from main import (
     is_point_on_route,
     get_effective_student_stop,
     get_active_missed_bus_allotment,
+    get_current_bus_id,
+    get_affected_students,
+    get_bus_location,
+    admin_bus_payload,
+    validate_trip_type,
     _POLYLINE_CACHE,
 )
 from database import SessionLocal, Base, engine
@@ -116,6 +121,152 @@ def test_min_distance_to_route_polyline():
     dist_m = min_distance_to_route_m(p_lat, p_lon, polyline)
     assert dist_m < 15.0
     assert dist_m <= ROUTE_MATCH_TOLERANCE_M
+
+
+def test_current_bus_resolver_preserves_missed_bus_precedence(monkeypatch):
+    """A live missed-bus allotment wins over a simultaneous temp change."""
+    from types import SimpleNamespace
+
+    student = SimpleNamespace(id=91, bus_id=1)
+    missed = SimpleNamespace(alternative_bus_id=3)
+    temporary = SimpleNamespace(target_bus_id=2)
+    monkeypatch.setattr("main.get_active_missed_bus_allotment", lambda db, student_id: missed)
+    monkeypatch.setattr("main.get_active_temporary_stop_change", lambda db, student_id: temporary)
+
+    assert get_current_bus_id(student, object()) == 3
+
+
+def test_current_bus_resolver_ignores_future_temp_change(monkeypatch):
+    """The resolver trusts the date-bounded temp-change query, not raw rows."""
+    from types import SimpleNamespace
+
+    student = SimpleNamespace(id=92, bus_id=1)
+    monkeypatch.setattr("main.get_active_missed_bus_allotment", lambda db, student_id: None)
+    monkeypatch.setattr("main.get_active_temporary_stop_change", lambda db, student_id: None)
+
+    assert get_current_bus_id(student, object()) == 1
+
+
+def test_current_bus_reverts_to_active_temp_target_when_alternative_trip_ends():
+    """Ending an alternative trip reveals the still-active temporary target."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    test_engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=test_engine)
+    session = sessionmaker(bind=test_engine)()
+    try:
+        student = Student(user_id=1, roll_number="OVERLAP_RESOLVER", bus_id=10, stop_id=100)
+        session.add(student)
+        session.commit()
+
+        temporary_change = TemporaryStopChange(
+            student_id=student.id,
+            original_stop_id=100,
+            temporary_stop_id=200,
+            target_bus_id=20,
+            start_date=date.today(),
+            end_date=date.today(),
+            status="active",
+            created_at=datetime.utcnow(),
+        )
+        alternative_trip = Trip(bus_id=30, driver_id=1, status="active")
+        session.add_all([temporary_change, alternative_trip])
+        session.commit()
+
+        session.add(MissedBusAllotment(
+            student_id=student.id,
+            original_bus_id=20,
+            alternative_bus_id=30,
+            alternative_trip_id=alternative_trip.id,
+            stop_id=200,
+            status="active",
+            created_at=datetime.utcnow(),
+        ))
+        session.commit()
+
+        assert get_current_bus_id(student, session) == 30
+
+        alternative_trip.status = "completed"
+        session.commit()
+
+        assert get_current_bus_id(student, session) == 20
+    finally:
+        session.close()
+        test_engine.dispose()
+
+
+def test_bus_notification_targeting_uses_current_temp_assignment(monkeypatch):
+    """A bus broadcast includes a temporary assignee only on the target bus."""
+    from types import SimpleNamespace
+
+    reassigned = SimpleNamespace(id=1, bus_id=10)
+    regular = SimpleNamespace(id=2, bus_id=20)
+
+    class StudentQuery:
+        def all(self):
+            return [reassigned, regular]
+
+    class FakeDB:
+        def query(self, model):
+            assert model is Student
+            return StudentQuery()
+
+    monkeypatch.setattr(
+        "main.get_current_bus_id",
+        lambda student, db: 20 if student.id == reassigned.id else student.bus_id,
+    )
+
+    old_bus_students = get_affected_students("bus", 10, FakeDB())
+    new_bus_students = get_affected_students("bus", 20, FakeDB())
+
+    assert reassigned not in old_bus_students
+    assert reassigned in new_bus_students
+
+
+def test_location_payloads_expose_whether_last_known_location_is_live():
+    """Last-known coordinates remain visible to admins but are marked non-live."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    test_engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=test_engine)
+    session = sessionmaker(bind=test_engine)()
+    try:
+        bus = Bus(bus_number="LOCATION_LIVE_FLAG")
+        session.add(bus)
+        session.commit()
+        session.add(BusLocation(bus_id=bus.id, latitude=18.0, longitude=79.0, speed=12))
+        session.commit()
+
+        inactive_location = get_bus_location(bus.id, session, {"role": "admin"})
+        inactive_admin_payload = admin_bus_payload(bus, session)
+        assert inactive_location["has_active_trip"] is False
+        assert inactive_admin_payload["has_active_trip"] is False
+        assert inactive_admin_payload["latest_location"] is not None
+
+        session.add(Trip(bus_id=bus.id, driver_id=1, status="active"))
+        session.commit()
+
+        active_location = get_bus_location(bus.id, session, {"role": "admin"})
+        assert active_location["has_active_trip"] is True
+    finally:
+        session.close()
+        test_engine.dispose()
+
+
+@pytest.mark.parametrize("trip_type", ["morning", " EVENING "])
+def test_trip_type_validation_accepts_driver_selected_values(trip_type):
+    assert validate_trip_type(trip_type) in {"morning", "evening"}
+
+
+@pytest.mark.parametrize("trip_type", [None, "", "night"])
+def test_trip_type_validation_rejects_missing_or_invalid_values(trip_type):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_trip_type(trip_type)
+    assert exc_info.value.status_code == 400
 
 
 # =====================================================================

@@ -56,6 +56,10 @@ class TravelStatusCreate(BaseModel):
     status: str = "not_travelling"
 
 
+class StartTripRequest(BaseModel):
+    trip_type: str | None = None
+
+
 class AdminBusCreate(BaseModel):
     bus_number: str
     registration_number: str | None = None

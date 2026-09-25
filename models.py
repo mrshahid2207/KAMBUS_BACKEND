@@ -136,6 +136,10 @@ class Trip(Base):
         nullable=False
     )
 
+    # Selected by the driver when starting a new trip. Historical rows from
+    # before this field was introduced remain NULL.
+    trip_type = Column(String(10), nullable=True)
+
     # ========================================
     # WAIT REQUEST BUDGET
     # ========================================
