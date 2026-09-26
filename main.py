@@ -488,12 +488,18 @@ def trip_runs_in_reverse(db: Session, trip: Trip, route_stops: list, latest_orde
     True when the trip travels from the highest stop_order towards the lowest
     (e.g. the evening run from college back to the stops).
 
-    Trips have no stored direction, so it is inferred from the trip's own GPS:
+    Driver-selected trip_type is authoritative for new trips. Legacy trips
+    without it retain the original GPS-based direction inference:
     - if the bus has moved to a different stop than where the trip's first GPS
-      point was, the direction of that movement decides;
+    point was, the direction of that movement decides;
     - otherwise the end of the route nearest to the first GPS point is taken as
-      the starting end (start near the highest order = reverse).
+    the starting end (start near the highest order = reverse).
     """
+    if trip.trip_type == "evening":
+        return True
+    if trip.trip_type == "morning":
+        return False
+
     first = (
         db.query(BusLocation)
         .filter(BusLocation.bus_id == trip.bus_id, BusLocation.trip_id == trip.id)
@@ -3348,7 +3354,10 @@ def create_wait_request(
 
     eta_minutes = get_eta_minutes_to_stop(db, target_bus_id, trip.id, stop)
     if eta_minutes is None:
-        raise HTTPException(status_code=400, detail="Live ETA is currently unavailable")
+        raise HTTPException(
+            status_code=400,
+            detail="The bus location is live, but its speed is unavailable, so we can't verify whether a wait request is eligible yet."
+        )
 
     if eta_minutes < WAIT_MIN_ETA_MINUTES or eta_minutes > WAIT_MAX_ETA_MINUTES:
         raise HTTPException(
@@ -3929,6 +3938,12 @@ def get_driver_route_stops(
         raise HTTPException(status_code=400, detail="No route assigned to this bus")
 
     today = date.today()
+    active_trip = (
+        db.query(Trip)
+        .filter(Trip.driver_id == driver.id, Trip.status == "active")
+        .order_by(Trip.started_at.desc())
+        .first()
+    )
 
     # 1. Fetch active route stops (excluding soft-deleted / inactive custom stops)
     regular_stops = (
@@ -3968,6 +3983,8 @@ def get_driver_route_stops(
                     stops_by_id[eff_stop.id] = eff_stop
 
     stops_list = sorted(stops_by_id.values(), key=lambda s: s.stop_order)
+    if active_trip and active_trip.trip_type == "evening":
+        stops_list.reverse()
 
     return {
         "bus_id": bus.id,
