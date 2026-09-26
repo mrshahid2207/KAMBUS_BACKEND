@@ -35,12 +35,12 @@ SECRET_KEY = os.getenv("JWT_SECRET")
 if not SECRET_KEY or len(SECRET_KEY) < 32:
     raise RuntimeError("JWT_SECRET must be set to a random string of at least 32 characters")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60  # admin and any other role
+ACCESS_TOKEN_EXPIRE_MINUTES = 7*20*60  # admin and any other role
 # Students stay signed in for 7 days and drivers for a year (effectively permanent).
 # Tokens cannot be revoked before they expire, except by changing JWT_SECRET,
 # which signs everyone out.
 ROLE_TOKEN_MINUTES = {
-    "student": 7 * 24 * 60,
+    "student": 60 * 24 * 60,
     "driver": 365 * 24 * 60,
 }
 
@@ -180,4 +180,4 @@ def require_student(
             detail="Student access required"
         )
 
-    return current_user
+    return current_user
