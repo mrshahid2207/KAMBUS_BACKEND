@@ -3994,6 +3994,7 @@ def get_driver_route_stops(
         "bus_id": bus.id,
         "bus_number": bus.bus_number,
         "route_id": bus.route_id,
+        "trip_type": active_trip.trip_type if active_trip else None,
         "total_stops": len(stops_list),
         "total_students_today": total_expected_today,
         "total_assigned_students": len(boarding_students),
