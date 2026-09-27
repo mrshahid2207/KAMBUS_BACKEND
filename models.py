@@ -37,6 +37,7 @@ class Student(Base):
     department = Column(String(100))
     bus_id = Column(Integer, ForeignKey("buses.id"), nullable=True)
     stop_id = Column(Integer, ForeignKey("stops.id"), nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
 
 
 class Driver(Base):
@@ -46,6 +47,7 @@ class Driver(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     driver_code = Column(String(20), unique=True, nullable=False, index=True)
     license_number = Column(String(100))
+    is_active = Column(Boolean, default=True, nullable=False)
 
 
 class Route(Base):

@@ -993,6 +993,15 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
         _record_login_failure(login_key)
         raise HTTPException(status_code=401, detail=bad_login_detail)
 
+    if data.role == "student":
+        student = db.query(Student).filter(Student.user_id == user.id).first()
+        if student and not student.is_active:
+            raise HTTPException(status_code=403, detail="This student account has been deactivated. Contact the transport office.")
+    elif data.role == "driver":
+        driver = db.query(Driver).filter(Driver.user_id == user.id).first()
+        if driver and not driver.is_active:
+            raise HTTPException(status_code=403, detail="This driver account has been deactivated. Contact the transport office.")
+
     _FAILED_LOGINS.pop(login_key, None)
 
     if user.role == "student" and getattr(user, "is_verified", 1) == 0:
@@ -4161,6 +4170,7 @@ def admin_driver_payload(driver: Driver, db: Session):
         "user_id": driver.user_id,
         "driver_code": driver.driver_code,
         "license_number": driver.license_number,
+        "is_active": driver.is_active,
         "name": user.name if user else None,
         "phone": user.phone if user else None,
         "bus_id": bus.id if bus else None,
@@ -4187,6 +4197,7 @@ def admin_student_payload(student: Student, db: Session):
         "student_id": student.id,
         "user_id": student.user_id,
         "roll_number": student.roll_number,
+        "is_active": student.is_active,
         "name": user.name if user else None,
         "phone": user.phone if user else None,
         "department": student.department,
@@ -4208,6 +4219,8 @@ def validate_bus_links(db: Session, route_id: int | None, driver_id: int | None,
         driver = db.query(Driver).filter(Driver.id == driver_id).first()
         if not driver:
             raise HTTPException(status_code=404, detail="Driver not found")
+        if not driver.is_active:
+            raise HTTPException(status_code=400, detail="Cannot assign a deactivated driver")
         other_bus = db.query(Bus).filter(Bus.driver_id == driver_id).first()
         if other_bus and other_bus.id != bus_id:
             other_bus.driver_id = None
@@ -4375,17 +4388,57 @@ def admin_delete_bus(bus_id: int, db: Session = Depends(get_db), current_user: d
     if not bus:
         raise HTTPException(status_code=404, detail="Bus not found")
 
+    bus_num = bus.bus_number
+    referenced = db.query(BusLocation).filter(BusLocation.bus_id == bus.id).first()
+    if referenced is None:
+        referenced = db.query(Trip).filter(Trip.bus_id == bus.id).first()
+    if referenced is None:
+        referenced = db.query(WaitRequest).filter(WaitRequest.bus_id == bus.id).first()
+    if referenced is None:
+        referenced = db.query(Notification).filter(Notification.related_bus_id == bus.id).first()
+    if referenced is None:
+        referenced = db.query(BusEntryLog).filter(BusEntryLog.bus_id == bus.id).first()
+    if referenced is None:
+        referenced = db.query(DriverComplaint).filter(DriverComplaint.bus_id == bus.id).first()
+    if referenced is None:
+        referenced = db.query(MissedBusAllotment).filter(
+            (MissedBusAllotment.original_bus_id == bus.id) |
+            (MissedBusAllotment.alternative_bus_id == bus.id)
+        ).first()
+    if referenced is None:
+        referenced = db.query(TemporaryStopChange).filter(
+            TemporaryStopChange.target_bus_id == bus.id
+        ).first()
+
     active_trip = db.query(Trip).filter(Trip.bus_id == bus.id, Trip.status == "active").first()
     if active_trip:
         raise HTTPException(status_code=400, detail="Cannot delete a bus that is currently on an active trip")
 
+    if referenced is not None:
+        db.query(Student).filter(Student.bus_id == bus.id).update({"bus_id": None})
+        bus.driver_id = None
+        bus.status = "inactive"
+        db.commit()
+        log_admin_activity(
+            db,
+            current_user["user_id"],
+            "DEACTIVATE_BUS",
+            "bus",
+            str(bus_id),
+            f"Deactivated Bus {bus_num} because it has historical references",
+        )
+        return {
+            "message": f"Bus {bus_num} has historical references and was deactivated instead of deleted",
+            "bus_id": bus_id,
+            "action": "deactivated",
+        }
+
     # Unassign students
     db.query(Student).filter(Student.bus_id == bus.id).update({"bus_id": None})
-    bus_num = bus.bus_number
     db.delete(bus)
     db.commit()
     log_admin_activity(db, current_user["user_id"], "DELETE_BUS", "bus", str(bus_id), f"Deleted Bus {bus_num}")
-    return {"message": f"Bus {bus_num} deleted successfully", "bus_id": bus_id}
+    return {"message": f"Bus {bus_num} deleted successfully", "bus_id": bus_id, "action": "deleted"}
 
 
 @app.post("/admin/buses/{bus_id}/assign-driver")
@@ -4403,6 +4456,8 @@ def admin_bus_assign_driver(
         driver = db.query(Driver).filter(Driver.id == data.driver_id).first()
         if not driver:
             raise HTTPException(status_code=404, detail="Driver not found")
+        if not driver.is_active:
+            raise HTTPException(status_code=400, detail="Cannot assign a deactivated driver")
         # Clear other bus assigned to this driver
         other_bus = db.query(Bus).filter(Bus.driver_id == data.driver_id).first()
         if other_bus and other_bus.id != bus.id:
@@ -4560,16 +4615,37 @@ def admin_delete_driver(driver_id: int, db: Session = Depends(get_db), current_u
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
 
-    # Unassign from any bus
-    db.query(Bus).filter(Bus.driver_id == driver.id).update({"driver_id": None})
     user = db.query(User).filter(User.id == driver.user_id).first()
     code = driver.driver_code
+    referenced = db.query(Trip).filter(Trip.driver_id == driver.id).first()
+    if referenced is None:
+        referenced = db.query(DriverComplaint).filter(DriverComplaint.driver_id == driver.id).first()
+
+    # Unassign from any bus
+    db.query(Bus).filter(Bus.driver_id == driver.id).update({"driver_id": None})
+    if referenced is not None:
+        driver.is_active = False
+        db.commit()
+        log_admin_activity(
+            db,
+            current_user["user_id"],
+            "DEACTIVATE_DRIVER",
+            "driver",
+            str(driver_id),
+            f"Deactivated driver {code} because it has historical references",
+        )
+        return {
+            "message": f"Driver {code} has historical references and was deactivated instead of deleted",
+            "driver_id": driver_id,
+            "action": "deactivated",
+        }
+
     db.delete(driver)
     if user:
         db.delete(user)
     db.commit()
     log_admin_activity(db, current_user["user_id"], "DELETE_DRIVER", "driver", str(driver_id), f"Deleted driver {code}")
-    return {"message": f"Driver {code} removed successfully", "driver_id": driver_id}
+    return {"message": f"Driver {code} removed successfully", "driver_id": driver_id, "action": "deleted"}
 
 
 # ------------------------------------------------------------
@@ -4712,12 +4788,49 @@ def admin_delete_student(student_id: int, db: Session = Depends(get_db), current
 
     user = db.query(User).filter(User.id == student.user_id).first()
     roll = student.roll_number
+    referenced = db.query(WaitRequest).filter(WaitRequest.student_id == student.id).first()
+    if referenced is None:
+        referenced = db.query(TravelStatus).filter(TravelStatus.student_id == student.id).first()
+    if referenced is None:
+        referenced = db.query(DriverComplaint).filter(DriverComplaint.student_id == student.id).first()
+    if referenced is None:
+        referenced = db.query(ComplaintVerification).filter(
+            ComplaintVerification.student_id == student.id
+        ).first()
+    if referenced is None:
+        referenced = db.query(MissedBusAllotment).filter(
+            MissedBusAllotment.student_id == student.id
+        ).first()
+    if referenced is None:
+        referenced = db.query(TemporaryStopChange).filter(
+            TemporaryStopChange.student_id == student.id
+        ).first()
+    if referenced is None:
+        referenced = db.query(Stop).filter(Stop.created_by_student_id == student.id).first()
+
+    if referenced is not None:
+        student.is_active = False
+        db.commit()
+        log_admin_activity(
+            db,
+            current_user["user_id"],
+            "DEACTIVATE_STUDENT",
+            "student",
+            str(student_id),
+            f"Deactivated student {roll} because it has historical references",
+        )
+        return {
+            "message": f"Student {roll} has historical references and was deactivated instead of deleted",
+            "student_id": student_id,
+            "action": "deactivated",
+        }
+
     db.delete(student)
     if user:
         db.delete(user)
     db.commit()
     log_admin_activity(db, current_user["user_id"], "DELETE_STUDENT", "student", str(student_id), f"Deleted student {roll}")
-    return {"message": f"Student {roll} deleted successfully", "student_id": student_id}
+    return {"message": f"Student {roll} deleted successfully", "student_id": student_id, "action": "deleted"}
 
 
 def notify_assignment_change(db, student, old_bus_id, old_stop_id):
@@ -4909,11 +5022,45 @@ def admin_delete_stop(stop_id: int, db: Session = Depends(get_db), current_user:
     if not stop:
         raise HTTPException(status_code=404, detail="Stop not found")
 
-    # Unassign students
-    db.query(Student).filter(Student.stop_id == stop.id).update({"stop_id": None})
     stop_name = stop.name
     route_id = stop.route_id
     deleted_order = stop.stop_order
+
+    blockers = []
+    stop_fk_target = f"{Stop.__tablename__}.id"
+    for mapper in Base.registry.mappers:
+        model = mapper.class_
+        stop_fk_columns = [
+            column
+            for column in model.__table__.columns
+            if any(fk.target_fullname == stop_fk_target for fk in column.foreign_keys)
+        ]
+        if not stop_fk_columns:
+            continue
+
+        condition = stop_fk_columns[0] == stop.id
+        for column in stop_fk_columns[1:]:
+            condition = condition | (column == stop.id)
+
+        reference_count = db.query(model).filter(condition).count()
+        if reference_count:
+            blockers.append(f"{model.__tablename__} ({reference_count} records)")
+
+    if blockers:
+        stop.is_active = False
+        db.commit()
+        log_admin_activity(
+            db, current_user["user_id"], "DEACTIVATE_STOP", "stop", str(stop_id),
+            f"Deactivated stop {stop_name} (referenced in: {', '.join(blockers)})"
+        )
+        return {
+            "message": f"Stop {stop_name} has historical references and was deactivated instead of deleted",
+            "stop_id": stop_id,
+            "action": "deactivated"
+        }
+
+    # Unassign students
+    db.query(Student).filter(Student.stop_id == stop.id).update({"stop_id": None})
     db.delete(stop)
 
     # Reorder remaining stops
@@ -4922,7 +5069,7 @@ def admin_delete_stop(stop_id: int, db: Session = Depends(get_db), current_user:
     )
     db.commit()
     log_admin_activity(db, current_user["user_id"], "DELETE_STOP", "stop", str(stop_id), f"Deleted stop {stop_name}")
-    return {"message": f"Stop {stop_name} deleted successfully", "stop_id": stop_id}
+    return {"message": f"Stop {stop_name} deleted successfully", "stop_id": stop_id, "action": "deleted"}
 
 
 # ------------------------------------------------------------
