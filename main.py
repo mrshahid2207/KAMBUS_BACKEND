@@ -5512,6 +5512,14 @@ def broadcast_admin_announcement(
 ):
     students = get_affected_students(data.target_type, data.target_id, db)
     recipients_count = len(students)
+    delivery = {
+        "fcm_available": True,
+        "attempted": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "skipped": 0,
+        "no_active_tokens": 0,
+    }
 
     for st in students:
         send_notification(
@@ -5524,7 +5532,8 @@ def broadcast_admin_announcement(
                 "template_type": data.template_type,
                 "target_type": data.target_type,
                 "target_id": data.target_id
-            }
+            },
+            delivery_summary=delivery,
         )
         try:
             notification_manager.push_notification_sync(st.user_id, {
@@ -5550,8 +5559,24 @@ def broadcast_admin_announcement(
     db.commit()
 
     log_admin_activity(db, current_user["user_id"], "SEND_ANNOUNCEMENT", "announcement", str(history.id), f"Sent '{data.title}' to {recipients_count} students")
+    delivered = (
+        delivery["fcm_available"]
+        and delivery["attempted"] > 0
+        and delivery["failed"] == 0
+    )
+    if not delivery["fcm_available"]:
+        warning = "Push notifications are not configured — announcement saved but not delivered."
+    elif delivery["failed"] > 0:
+        warning = f"{delivery['failed']} of {delivery['attempted']} devices did not receive this."
+    elif delivery["no_active_tokens"] > 0 and delivery["attempted"] == 0:
+        warning = "No active devices found for the selected recipients."
+    else:
+        warning = None
     return {
         "success": True,
+        "delivered": delivered,
+        "warning": warning,
+        "delivery": delivery,
         "message": f"Announcement broadcasted successfully to {recipients_count} students.",
         "recipient_count": recipients_count,
         "history_id": history.id

@@ -15,6 +15,10 @@ def _firebase():
         return messaging
     credential_path = os.getenv("FCM_SERVICE_ACCOUNT_FILE")
     if not credential_path:
+        log.warning(
+            "FCM skipped: FCM_SERVICE_ACCOUNT_FILE is not configured; "
+            "notification will be persisted but push delivery is unavailable."
+        )
         return None
     try:
         import firebase_admin
@@ -30,7 +34,8 @@ def _firebase():
 def send_notification(db: Session, user_id: int, title: str, message: str,
                       notification_type: str, data: dict | None = None,
                       related_bus_id: int | None = None, related_trip_id: int | None = None,
-                      related_wait_request_id: int | None = None) -> Notification:
+                      related_wait_request_id: int | None = None,
+                      delivery_summary: dict | None = None) -> Notification:
     notification = Notification(user_id=user_id, title=title, message=message,
         type=notification_type, payload=json.dumps(data or {}), related_bus_id=related_bus_id,
         related_trip_id=related_trip_id, related_wait_request_id=related_wait_request_id)
@@ -38,9 +43,20 @@ def send_notification(db: Session, user_id: int, title: str, message: str,
     db.flush()
     messaging = _firebase()
     if not messaging:
+        if delivery_summary is not None:
+            delivery_summary["fcm_available"] = False
+            delivery_summary["skipped"] += 1
         return notification
-    for device in db.query(DeviceToken).filter(DeviceToken.user_id == user_id, DeviceToken.is_active == 1).all():
+    devices = db.query(DeviceToken).filter(
+        DeviceToken.user_id == user_id,
+        DeviceToken.is_active == 1,
+    ).all()
+    if not devices and delivery_summary is not None:
+        delivery_summary["no_active_tokens"] += 1
+    for device in devices:
         try:
+            if delivery_summary is not None:
+                delivery_summary["attempted"] += 1
             message_id = messaging.send(messaging.Message(
                 notification=messaging.Notification(title=title, body=message),
                 data={str(k): str(v) for k, v in (data or {}).items()},
@@ -53,8 +69,12 @@ def send_notification(db: Session, user_id: int, title: str, message: str,
                 device.id,
                 message_id,
             )
+            if delivery_summary is not None:
+                delivery_summary["succeeded"] += 1
         except Exception:
             # Invalid tokens must never break the business action that triggered a notification.
             log.exception("FCM send failed for device token %s", device.id)
+            if delivery_summary is not None:
+                delivery_summary["failed"] += 1
             device.is_active = 0
     return notification
