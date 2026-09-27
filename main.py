@@ -1999,6 +1999,10 @@ def get_student_route_stops(
         .order_by(Stop.stop_order.asc())
         .all()
     )
+    stops_list = list(stops)
+    active_trip = get_active_trip_for_bus(db, target_bus_id)
+    if active_trip and active_trip.trip_type == "evening":
+        stops_list.reverse()
 
     return {
         "bus_id": bus.id,
@@ -2012,7 +2016,7 @@ def get_student_route_stops(
                 "longitude": stop.longitude,
                 "stop_order": stop.stop_order
             }
-            for stop in stops
+            for stop in stops_list
         ]
     }
 
