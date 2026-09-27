@@ -4804,6 +4804,8 @@ def admin_stop_payload(stop: Stop, db: Session):
         "name": stop.name,
         "latitude": stop.latitude,
         "longitude": stop.longitude,
+        "evening_latitude": stop.evening_latitude,
+        "evening_longitude": stop.evening_longitude,
         "stop_order": stop.stop_order,
         "student_count": student_count
     }
@@ -4856,6 +4858,8 @@ def admin_create_route_stop(
         name=data.name,
         latitude=data.latitude,
         longitude=data.longitude,
+        evening_latitude=data.evening_latitude,
+        evening_longitude=data.evening_longitude,
         stop_order=data.stop_order
     )
     db.add(stop)
@@ -4882,6 +4886,10 @@ def admin_update_stop(
         stop.latitude = data.latitude
     if data.longitude is not None:
         stop.longitude = data.longitude
+    if data.evening_latitude is not None:
+        stop.evening_latitude = data.evening_latitude
+    if data.evening_longitude is not None:
+        stop.evening_longitude = data.evening_longitude
     if data.stop_order is not None:
         stop.stop_order = data.stop_order
     if data.route_id is not None:

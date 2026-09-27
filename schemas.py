@@ -98,6 +98,8 @@ class AdminStopCreate(BaseModel):
     name: str
     latitude: float
     longitude: float
+    evening_latitude: float | None = None
+    evening_longitude: float | None = None
     stop_order: int
 
 
@@ -165,6 +167,8 @@ class AdminStopUpdate(BaseModel):
     name: str | None = None
     latitude: float | None = None
     longitude: float | None = None
+    evening_latitude: float | None = None
+    evening_longitude: float | None = None
     stop_order: int | None = None
     route_id: int | None = None
 
