@@ -2019,20 +2019,29 @@ def get_student_route_stops(
     if active_trip and active_trip.trip_type == "evening":
         stops_list.reverse()
 
+    is_evening = bool(active_trip and active_trip.trip_type == "evening")
+
+    def route_stop_payload(stop: Stop) -> dict:
+        use_evening_coords = (
+            is_evening
+            and stop.evening_latitude is not None
+            and stop.evening_longitude is not None
+        )
+        stop_lat = stop.evening_latitude if use_evening_coords else stop.latitude
+        stop_lng = stop.evening_longitude if use_evening_coords else stop.longitude
+        return {
+            "stop_id": stop.id,
+            "name": stop.name,
+            "latitude": stop_lat,
+            "longitude": stop_lng,
+            "stop_order": stop.stop_order,
+        }
+
     return {
         "bus_id": bus.id,
         "bus_number": bus.bus_number,
         "route_id": bus.route_id,
-        "stops": [
-            {
-                "stop_id": stop.id,
-                "name": stop.name,
-                "latitude": stop.latitude,
-                "longitude": stop.longitude,
-                "stop_order": stop.stop_order
-            }
-            for stop in stops_list
-        ]
+        "stops": [route_stop_payload(stop) for stop in stops_list]
     }
 
 @app.get("/student/all-bus-routes")
@@ -2084,8 +2093,8 @@ MAX_TEMP_STOP_DISTANCE_KM = 1.5
 # Tolerance for arbitrary-point-to-route-polyline distance checking (30m for driver-phone GPS accuracy).
 ROUTE_MATCH_TOLERANCE_M = 30.0
 
-# In-memory cache for OSRM route polylines: {route_id: (timestamp, points)}
-_POLYLINE_CACHE: dict[int, tuple[float, list[tuple[float, float]]]] = {}
+# In-memory cache for OSRM route polylines: {(route_id, trip_type): (timestamp, points)}
+_POLYLINE_CACHE: dict[tuple[int, str | None], tuple[float, list[tuple[float, float]]]] = {}
 _POLYLINE_CACHE_TTL_SECONDS = 300  # 5 minutes
 
 
@@ -2202,7 +2211,7 @@ def extend_polyline_endpoints(
 
 
 def get_route_polyline_points(
-    db: Session, route_id: int
+    db: Session, route_id: int, trip_type: str | None = None
 ) -> list[tuple[float, float]]:
     """
     Return the driving geometry for *route_id* as an ordered list of
@@ -2217,7 +2226,8 @@ def get_route_polyline_points(
     import time as _time
 
     now = _time.monotonic()
-    cached = _POLYLINE_CACHE.get(route_id)
+    cache_key = (route_id, trip_type)
+    cached = _POLYLINE_CACHE.get(cache_key)
     if cached and now - cached[0] < _POLYLINE_CACHE_TTL_SECONDS:
         return cached[1]
 
@@ -2228,20 +2238,34 @@ def get_route_polyline_points(
         .order_by(Stop.stop_order)
         .all()
     )
-    # Filter out stops without coordinates
-    valid_stops = [s for s in stops if s.latitude is not None and s.longitude is not None]
-    fallback = [(s.latitude, s.longitude) for s in valid_stops]
+    is_evening = trip_type == "evening"
+    if is_evening:
+        stops.reverse()
+
+    # Select the evening-side coordinates when available, otherwise preserve
+    # the regular pin so partially configured routes still render correctly.
+    valid_stops: list[tuple[float, float]] = []
+    for stop in stops:
+        use_evening_coords = (
+            is_evening
+            and stop.evening_latitude is not None
+            and stop.evening_longitude is not None
+        )
+        stop_lat = stop.evening_latitude if use_evening_coords else stop.latitude
+        stop_lng = stop.evening_longitude if use_evening_coords else stop.longitude
+        if stop_lat is not None and stop_lng is not None:
+            valid_stops.append((stop_lat, stop_lng))
+    fallback = list(valid_stops)
 
     # Include College destination if not already present as the final stop
     COLLEGE_LAT = 18.054145
     COLLEGE_LNG = 79.535587
     waypoints = list(valid_stops)
     if valid_stops:
-        last_s = valid_stops[-1]
-        dist_to_college_km = haversine_km(last_s.latitude, last_s.longitude, COLLEGE_LAT, COLLEGE_LNG)
+        last_lat, last_lng = valid_stops[-1]
+        dist_to_college_km = haversine_km(last_lat, last_lng, COLLEGE_LAT, COLLEGE_LNG)
         if dist_to_college_km > 0.1:  # More than 100m from college
-            college_wp = type("CollegeStop", (), {"latitude": COLLEGE_LAT, "longitude": COLLEGE_LNG})()
-            waypoints.append(college_wp)
+            waypoints.append((COLLEGE_LAT, COLLEGE_LNG))
             fallback.append((COLLEGE_LAT, COLLEGE_LNG))
 
     if len(waypoints) < 2:
@@ -2249,7 +2273,7 @@ def get_route_polyline_points(
         return extended_fallback
 
     # Build OSRM coordinate string: lon,lat;lon,lat;...
-    coord_str = ";".join(f"{s.longitude},{s.latitude}" for s in waypoints)
+    coord_str = ";".join(f"{longitude},{latitude}" for latitude, longitude in waypoints)
     osrm_urls = [
         f"https://router.project-osrm.org/route/v1/driving/{coord_str}?overview=full&geometries=geojson&steps=false",
         f"https://kambus-orsm.onrender.com/route/v1/driving/{coord_str}?overview=full&geometries=geojson",
@@ -2266,13 +2290,13 @@ def get_route_polyline_points(
                         # GeoJSON coords are [lon, lat]
                         points: list[tuple[float, float]] = [(c[1], c[0]) for c in coords]
                         extended_points = extend_polyline_endpoints(points)
-                        _POLYLINE_CACHE[route_id] = (now, extended_points)
+                        _POLYLINE_CACHE[cache_key] = (now, extended_points)
                         return extended_points
         except Exception:
             continue
 
     extended_fallback = extend_polyline_endpoints(fallback)
-    _POLYLINE_CACHE[route_id] = (now, extended_fallback)
+    _POLYLINE_CACHE[cache_key] = (now, extended_fallback)
     return extended_fallback
 
 
@@ -4036,6 +4060,26 @@ def get_driver_route_stops(
     if active_trip and active_trip.trip_type == "evening":
         stops_list.reverse()
 
+    is_evening = bool(active_trip and active_trip.trip_type == "evening")
+
+    def route_stop_payload(stop: Stop) -> dict:
+        use_evening_coords = (
+            is_evening
+            and stop.evening_latitude is not None
+            and stop.evening_longitude is not None
+        )
+        stop_lat = stop.evening_latitude if use_evening_coords else stop.latitude
+        stop_lng = stop.evening_longitude if use_evening_coords else stop.longitude
+        return {
+            "stop_id": stop.id,
+            "name": stop.name,
+            "latitude": stop_lat,
+            "longitude": stop_lng,
+            "stop_order": stop.stop_order,
+            "is_custom": getattr(stop, "is_custom", False),
+            "student_count": stop_student_counts.get(stop.id, 0),
+        }
+
     return {
         "bus_id": bus.id,
         "bus_number": bus.bus_number,
@@ -4049,18 +4093,7 @@ def get_driver_route_stops(
             "longitude": COLLEGE_LNG,
             "name": "KITSW / College"
         },
-        "stops": [
-            {
-                "stop_id": stop.id,
-                "name": stop.name,
-                "latitude": stop.latitude,
-                "longitude": stop.longitude,
-                "stop_order": stop.stop_order,
-                "is_custom": getattr(stop, "is_custom", False),
-                "student_count": stop_student_counts.get(stop.id, 0)
-            }
-            for stop in stops_list
-        ]
+        "stops": [route_stop_payload(stop) for stop in stops_list]
     }
 @app.post("/student/travel-status")
 def update_travel_status(
