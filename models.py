@@ -471,6 +471,10 @@ class TemporaryStopChange(Base):
     student_id = Column(Integer, ForeignKey("students.id"), nullable=False, index=True)
     original_stop_id = Column(Integer, ForeignKey("stops.id"), nullable=False)
     temporary_stop_id = Column(Integer, ForeignKey("stops.id"), nullable=False)
+    # Direction-specific stops. Legacy rows retain ``temporary_stop_id`` and
+    # are backfilled to both columns by the accompanying migration.
+    morning_temporary_stop_id = Column(Integer, ForeignKey("stops.id"), nullable=True)
+    evening_temporary_stop_id = Column(Integer, ForeignKey("stops.id"), nullable=True)
     start_date = Column(Date, nullable=False, index=True)
     end_date = Column(Date, nullable=False, index=True)
     status = Column(String(20), default="scheduled", nullable=False, index=True)

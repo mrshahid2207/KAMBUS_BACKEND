@@ -236,6 +236,14 @@ class StudentSelectStopRequest(BaseModel):
     stop_id: int
 
 
+class TemporaryStopLocation(BaseModel):
+    """One direction's temporary-stop input."""
+    stop_id: int | None = None
+    latitude: float | None = Field(None, ge=-90, le=90, validation_alias=AliasChoices("latitude", "lat"))
+    longitude: float | None = Field(None, ge=-180, le=180, validation_alias=AliasChoices("longitude", "lng"))
+    address: str | None = Field(None, max_length=255)
+
+
 class TemporaryStopChangeCreate(BaseModel):
     # Either stop_id OR (latitude + longitude) must be provided — not both.
     stop_id: int | None = None
@@ -245,6 +253,11 @@ class TemporaryStopChangeCreate(BaseModel):
     # Reverse-geocoded label the client resolved for this point
     # (e.g. "MG Road, Warangal"). Optional — falls back to "Custom Stop".
     address: str | None = Field(None, max_length=255)
+
+    # Directional input. The original flat fields above remain supported for
+    # existing clients; a single supplied direction is mirrored to the other.
+    morning_location: TemporaryStopLocation | None = None
+    evening_location: TemporaryStopLocation | None = None
 
     start_date: date
     end_date: date

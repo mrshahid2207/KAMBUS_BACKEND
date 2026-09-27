@@ -382,6 +382,29 @@ def initialize_trip_database():
                     connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN match_distance_m FLOAT"))
                 except Exception:
                     pass
+            if "morning_temporary_stop_id" not in temp_cols:
+                try:
+                    connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN morning_temporary_stop_id INTEGER REFERENCES stops(id)"))
+                except Exception:
+                    pass
+            if "evening_temporary_stop_id" not in temp_cols:
+                try:
+                    connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN evening_temporary_stop_id INTEGER REFERENCES stops(id)"))
+                except Exception:
+                    pass
+            try:
+                connection.execute(text("""
+                    UPDATE temporary_stop_changes
+                    SET morning_temporary_stop_id = temporary_stop_id
+                    WHERE morning_temporary_stop_id IS NULL
+                """))
+                connection.execute(text("""
+                    UPDATE temporary_stop_changes
+                    SET evening_temporary_stop_id = temporary_stop_id
+                    WHERE evening_temporary_stop_id IS NULL
+                """))
+            except Exception:
+                pass
 
 
 # The production startup event repeats this idempotent check. Running it here
@@ -2010,12 +2033,18 @@ def get_student_route_stops(
 
     stops = (
         db.query(Stop)
-        .filter(Stop.route_id == bus.route_id, Stop.is_active == True)
+        .filter(Stop.route_id == bus.route_id, Stop.is_active == True, Stop.is_custom == False)
         .order_by(Stop.stop_order.asc())
         .all()
     )
     stops_list = list(stops)
     active_trip = get_active_trip_for_bus(db, target_bus_id)
+    effective_stop, temp_change = get_effective_student_stop(
+        db, student, active_trip.trip_type if active_trip else None
+    )
+    if temp_change and effective_stop and effective_stop.is_active and effective_stop.id not in {stop.id for stop in stops_list}:
+        stops_list.append(effective_stop)
+        stops_list.sort(key=lambda stop: stop.stop_order)
     if active_trip and active_trip.trip_type == "evening":
         stops_list.reverse()
 
@@ -2377,10 +2406,18 @@ def get_or_create_custom_stop(
 
 def _deactivate_custom_stop(db: Session, change: TemporaryStopChange) -> None:
     """Soft-retire the custom Stop tied to an expired/cancelled change."""
-    if change and change.temporary_stop_id:
-        stop = db.query(Stop).filter(Stop.id == change.temporary_stop_id).first()
-        if stop and getattr(stop, "is_custom", False) and getattr(stop, "is_active", True):
-            stop.is_active = False
+    if change:
+        stop_ids = {
+            stop_id for stop_id in (
+                change.temporary_stop_id,
+                getattr(change, "morning_temporary_stop_id", None),
+                getattr(change, "evening_temporary_stop_id", None),
+            ) if stop_id
+        }
+        for stop_id in stop_ids:
+            stop = db.query(Stop).filter(Stop.id == stop_id).first()
+            if stop and getattr(stop, "is_custom", False) and getattr(stop, "is_active", True):
+                stop.is_active = False
 
 
 def find_candidate_buses_for_location(
@@ -2568,12 +2605,20 @@ def get_active_temporary_stop_change(db: Session, student_id: int, on_date: date
     return change
 
 
-def get_effective_student_stop(db: Session, student: Student):
-    """Return the currently effective stop, preferring an active temporary stop."""
+def get_effective_student_stop(db: Session, student: Student, trip_type: str | None = None):
+    """Return the effective stop, selecting a directional temporary stop when known."""
     expire_temporary_stop_changes(db, student.id)
     temp_change = get_active_temporary_stop_change(db, student.id)
     if temp_change:
-        temp_stop = db.query(Stop).filter(Stop.id == temp_change.temporary_stop_id).first()
+        if trip_type == "evening":
+            temp_stop_id = getattr(temp_change, "evening_temporary_stop_id", None) or temp_change.temporary_stop_id
+        elif trip_type == "morning":
+            temp_stop_id = getattr(temp_change, "morning_temporary_stop_id", None) or temp_change.temporary_stop_id
+        else:
+            # Preserve the historical single-stop/default-morning behavior for
+            # callers that do not have active-trip direction available.
+            temp_stop_id = temp_change.temporary_stop_id
+        temp_stop = db.query(Stop).filter(Stop.id == temp_stop_id).first()
         if temp_stop and getattr(temp_stop, "is_active", True):
             return temp_stop, temp_change
 
@@ -2752,9 +2797,12 @@ def get_student_my_stop(
     if student.stop_id is None:
         raise HTTPException(status_code=404, detail="No stop assigned to this student")
 
-    stop, temp_change = get_effective_student_stop(db, student)
     target_bus_id = get_current_bus_id(student, db)
     bus = db.query(Bus).filter(Bus.id == target_bus_id).first()
+    active_trip = get_active_trip_for_bus(db, target_bus_id) if target_bus_id else None
+    stop, temp_change = get_effective_student_stop(
+        db, student, active_trip.trip_type if active_trip else None
+    )
     if not bus or not stop:
         raise HTTPException(status_code=404, detail="Assigned stop or bus not found")
 
@@ -2819,11 +2867,16 @@ def automatically_allot_alternative_bus(
 
     current_bus_id = get_current_bus_id(student, db)
     original_bus = db.query(Bus).filter(Bus.id == current_bus_id).first()
-    stop, temp_change = get_effective_student_stop(db, student)
-    if not original_bus or not stop:
-        raise HTTPException(status_code=404, detail="Current bus or stop could not be found")
+    if not original_bus:
+        raise HTTPException(status_code=404, detail="Current bus could not be found")
 
     original_trip = get_active_trip_for_bus(db, original_bus.id)
+    stop, temp_change = get_effective_student_stop(
+        db, student, original_trip.trip_type if original_trip else None
+    )
+    if not stop:
+        raise HTTPException(status_code=404, detail="Current bus or stop could not be found")
+
     if original_trip:
         if not has_passed_stop(db, original_trip, stop):
             raise HTTPException(status_code=400, detail="Your bus has not reached your stop yet.")
@@ -2938,7 +2991,7 @@ def get_alternative_bus_allotment(
 # MAP-BASED TEMPORARY STOP ENDPOINTS
 # ============================================================
 
-def _validate_temporary_stop_input(data: TemporaryStopCheckRequest | TemporaryStopChangeCreate) -> None:
+def _validate_temporary_stop_input(data) -> None:
     """Require exactly one temporary-stop input mode."""
     has_stop = data.stop_id is not None
     has_coordinates = data.latitude is not None or data.longitude is not None
@@ -2946,6 +2999,45 @@ def _validate_temporary_stop_input(data: TemporaryStopCheckRequest | TemporarySt
         raise HTTPException(status_code=400, detail="Provide either stop_id OR latitude/longitude, not both")
     if not has_stop and (data.latitude is None or data.longitude is None):
         raise HTTPException(status_code=400, detail="Either stop_id OR latitude and longitude must be provided")
+
+
+def _get_directional_temporary_stop_inputs(data: TemporaryStopChangeCreate):
+    """Resolve new directional input while accepting the legacy flat payload."""
+    legacy_input = data if any(value is not None for value in (data.stop_id, data.latitude, data.longitude)) else None
+    morning_input = data.morning_location or legacy_input or data.evening_location
+    evening_input = data.evening_location or legacy_input or data.morning_location
+    if not morning_input or not evening_input:
+        raise HTTPException(status_code=400, detail="Provide at least one temporary-stop location")
+    _validate_temporary_stop_input(morning_input)
+    _validate_temporary_stop_input(evening_input)
+    return morning_input, evening_input
+
+
+def _temporary_stop_input_matches_bus(db: Session, location, bus: Bus) -> bool:
+    if not bus.route_id:
+        return False
+    if location.stop_id is not None:
+        stop = db.query(Stop).filter(Stop.id == location.stop_id, Stop.is_active == True).first()
+        return bool(stop and stop.route_id == bus.route_id)
+    route_points = get_route_polyline_points(db, bus.route_id)
+    distance_m = min_distance_to_route_m(location.latitude, location.longitude, route_points)
+    return round(distance_m, 2) <= ROUTE_MATCH_TOLERANCE_M
+
+
+def _get_or_create_temporary_stop_for_location(db: Session, location, bus: Bus, student_id: int) -> Stop:
+    if location.stop_id is not None:
+        stop = db.query(Stop).filter(Stop.id == location.stop_id, Stop.is_active == True).first()
+        if not stop:
+            raise HTTPException(status_code=404, detail="Selected stop not found")
+        return stop
+    return get_or_create_custom_stop(
+        db,
+        route_id=bus.route_id,
+        latitude=location.latitude,
+        longitude=location.longitude,
+        address=location.address,
+        student_id=student_id,
+    )
 
 
 def _normal_route_stops(db: Session, bus: Bus) -> list[Stop]:
@@ -3025,7 +3117,7 @@ def create_temporary_stop_change(
             detail="A regular bus and stop must be assigned before using temporary stop change",
         )
 
-    _validate_temporary_stop_input(data)
+    morning_input, evening_input = _get_directional_temporary_stop_inputs(data)
 
     if data.start_date > data.end_date:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
@@ -3052,120 +3144,44 @@ def create_temporary_stop_change(
     if overlapping:
         raise HTTPException(status_code=409, detail="You already have an overlapping temporary stop change")
 
-    # Check if on-route or off-route
-    on_route = False
-    if data.stop_id is not None:
-        target_stop = db.query(Stop).filter(Stop.id == data.stop_id).first()
-        if not target_stop:
-            raise HTTPException(status_code=404, detail="Selected stop not found")
-        if target_stop.route_id == original_bus.route_id:
-            on_route = True
-    elif data.latitude is not None and data.longitude is not None:
-        polyline = get_route_polyline_points(db, original_bus.route_id)
-        dist_m = min_distance_to_route_m(data.latitude, data.longitude, polyline)
-        if round(dist_m, 2) <= ROUTE_MATCH_TOLERANCE_M:
-            on_route = True
+    # Both directional locations must be served by one bus. The legacy request
+    # shape resolves to the same input for each direction, preserving old clients.
+    candidate_buses = db.query(Bus).filter(Bus.status == "active").all()
+    matching_buses = [
+        bus for bus in candidate_buses
+        if _temporary_stop_input_matches_bus(db, morning_input, bus)
+        and _temporary_stop_input_matches_bus(db, evening_input, bus)
+    ]
+    if not matching_buses:
+        raise HTTPException(status_code=400, detail="No single bus route covers both temporary-stop locations")
 
-    if on_route:
-        if data.stop_id is not None:
-            temp_stop = db.query(Stop).filter(Stop.id == data.stop_id).first()
-        else:
-            temp_stop = get_or_create_custom_stop(
-                db,
-                route_id=original_bus.route_id,
-                latitude=data.latitude,
-                longitude=data.longitude,
-                address=data.address,
-                student_id=student.id,
-            )
-
-        status_val = "active" if data.start_date <= date.today() <= data.end_date else "scheduled"
-        change = TemporaryStopChange(
-            student_id=student.id,
-            original_stop_id=original_stop.id,
-            temporary_stop_id=temp_stop.id,
-            start_date=data.start_date,
-            end_date=data.end_date,
-            status=status_val,
-            created_at=datetime.utcnow(),
-            selected_latitude=data.latitude if data.latitude is not None else temp_stop.latitude,
-            selected_longitude=data.longitude if data.longitude is not None else temp_stop.longitude,
-            selected_address=temp_stop.name,
-            target_bus_id=original_bus.id,
-            is_approximate_match=False,
-            match_distance_m=0.0,
-        )
-        db.add(change)
-        db.commit()
-        db.refresh(change)
-
-        return {
-            "success": True,
-            "message": "Temporary stop change scheduled automatically",
-            "request_id": change.id,
-            "original_stop_id": original_stop.id,
-            "original_stop_name": original_stop.name,
-            "temporary_stop_id": temp_stop.id,
-            "temporary_stop_name": temp_stop.name,
-            "temporary_latitude": temp_stop.latitude,
-            "temporary_longitude": temp_stop.longitude,
-            "start_date": change.start_date,
-            "end_date": change.end_date,
-            "status": change.status,
-            "target_bus_id": original_bus.id,
-        }
-
-    # Off-route candidate bus search
-    candidates, is_approx, min_dist_m = find_candidate_buses_for_location(
-        db,
-        stop_id=data.stop_id,
-        lat=data.latitude,
-        lng=data.longitude,
-        student_bus_id=original_bus.id,
+    chosen_bus_id = data.target_bus_id or (
+        original_bus.id if any(bus.id == original_bus.id for bus in matching_buses) else matching_buses[0].id
     )
+    target_bus = next((bus for bus in matching_buses if bus.id == chosen_bus_id), None)
+    if not target_bus:
+        raise HTTPException(status_code=400, detail="Selected bus does not cover both temporary-stop locations")
 
-    if not candidates:
-        raise HTTPException(
-            status_code=400,
-            detail="No bus is currently travelling through this route.",
-        )
-
-    chosen_bus_id = data.target_bus_id or candidates[0]["bus_id"]
-    chosen_candidate = next((candidate for candidate in candidates if candidate["bus_id"] == chosen_bus_id), None)
-    if not chosen_candidate:
-        raise HTTPException(status_code=400, detail="Selected bus does not cover the requested stop or location")
-
-    target_bus = db.query(Bus).filter(Bus.id == chosen_bus_id).first()
-    if not target_bus or not target_bus.route_id:
-        raise HTTPException(status_code=400, detail="Invalid target bus selected")
-
-    if data.stop_id is not None:
-        temp_stop = db.query(Stop).filter(Stop.id == data.stop_id).first()
-    else:
-        temp_stop = get_or_create_custom_stop(
-            db,
-            route_id=target_bus.route_id,
-            latitude=data.latitude,
-            longitude=data.longitude,
-            address=data.address,
-            student_id=student.id,
-        )
-
+    morning_stop = _get_or_create_temporary_stop_for_location(db, morning_input, target_bus, student.id)
+    evening_stop = _get_or_create_temporary_stop_for_location(db, evening_input, target_bus, student.id)
     status_val = "active" if data.start_date <= date.today() <= data.end_date else "scheduled"
     change = TemporaryStopChange(
         student_id=student.id,
         original_stop_id=original_stop.id,
-        temporary_stop_id=temp_stop.id,
+        # Keep legacy consumers functional: morning remains the default stop.
+        temporary_stop_id=morning_stop.id,
+        morning_temporary_stop_id=morning_stop.id,
+        evening_temporary_stop_id=evening_stop.id,
         start_date=data.start_date,
         end_date=data.end_date,
         status=status_val,
         created_at=datetime.utcnow(),
-        selected_latitude=data.latitude if data.latitude is not None else temp_stop.latitude,
-        selected_longitude=data.longitude if data.longitude is not None else temp_stop.longitude,
-        selected_address=temp_stop.name,
+        selected_latitude=morning_stop.latitude,
+        selected_longitude=morning_stop.longitude,
+        selected_address=morning_stop.name,
         target_bus_id=target_bus.id,
-        is_approximate_match=chosen_candidate["is_approximate_match"],
-        match_distance_m=chosen_candidate["match_distance_m"],
+        is_approximate_match=False,
+        match_distance_m=0.0,
     )
     db.add(change)
     db.commit()
@@ -3177,10 +3193,18 @@ def create_temporary_stop_change(
         "request_id": change.id,
         "original_stop_id": original_stop.id,
         "original_stop_name": original_stop.name,
-        "temporary_stop_id": temp_stop.id,
-        "temporary_stop_name": temp_stop.name,
-        "temporary_latitude": temp_stop.latitude,
-        "temporary_longitude": temp_stop.longitude,
+        "temporary_stop_id": morning_stop.id,
+        "temporary_stop_name": morning_stop.name,
+        "temporary_latitude": morning_stop.latitude,
+        "temporary_longitude": morning_stop.longitude,
+        "morning_temporary_stop_id": morning_stop.id,
+        "morning_temporary_stop_name": morning_stop.name,
+        "morning_temporary_latitude": morning_stop.latitude,
+        "morning_temporary_longitude": morning_stop.longitude,
+        "evening_temporary_stop_id": evening_stop.id,
+        "evening_temporary_stop_name": evening_stop.name,
+        "evening_temporary_latitude": evening_stop.latitude,
+        "evening_temporary_longitude": evening_stop.longitude,
         "start_date": change.start_date,
         "end_date": change.end_date,
         "status": change.status,
@@ -3210,6 +3234,12 @@ def get_temporary_stop_change(
         return {"active": False, "scheduled": False, "pending_approval": False}
 
     temporary_stop = db.query(Stop).filter(Stop.id == change.temporary_stop_id).first()
+    morning_stop = db.query(Stop).filter(
+        Stop.id == (getattr(change, "morning_temporary_stop_id", None) or change.temporary_stop_id)
+    ).first()
+    evening_stop = db.query(Stop).filter(
+        Stop.id == (getattr(change, "evening_temporary_stop_id", None) or change.temporary_stop_id)
+    ).first()
     target_bus = db.query(Bus).filter(Bus.id == change.target_bus_id).first() if change.target_bus_id else None
     today = date.today()
     active = change.start_date <= today <= change.end_date and change.status in ("scheduled", "active")
@@ -3227,6 +3257,14 @@ def get_temporary_stop_change(
         "temporary_stop_name": temporary_stop.name if temporary_stop else change.selected_address,
         "temporary_latitude": temporary_stop.latitude if temporary_stop else change.selected_latitude,
         "temporary_longitude": temporary_stop.longitude if temporary_stop else change.selected_longitude,
+        "morning_temporary_stop_id": morning_stop.id if morning_stop else change.temporary_stop_id,
+        "morning_temporary_stop_name": morning_stop.name if morning_stop else change.selected_address,
+        "morning_temporary_latitude": morning_stop.latitude if morning_stop else change.selected_latitude,
+        "morning_temporary_longitude": morning_stop.longitude if morning_stop else change.selected_longitude,
+        "evening_temporary_stop_id": evening_stop.id if evening_stop else change.temporary_stop_id,
+        "evening_temporary_stop_name": evening_stop.name if evening_stop else change.selected_address,
+        "evening_temporary_latitude": evening_stop.latitude if evening_stop else change.selected_latitude,
+        "evening_temporary_longitude": evening_stop.longitude if evening_stop else change.selected_longitude,
         "target_bus_id": change.target_bus_id,
         "target_bus_number": target_bus.bus_number if target_bus else None,
         "start_date": change.start_date,
@@ -3400,11 +3438,7 @@ def create_wait_request(
     if not student:
         raise HTTPException(status_code=404, detail="Student profile not found")
 
-    # Resolve effective stop and bus (respecting temporary stop change and missed bus allotment)
-    stop, temp_change = get_effective_student_stop(db, student)
-    if not stop:
-        raise HTTPException(status_code=404, detail="Assigned stop not found")
-
+    # Resolve the active trip first so a directional temporary stop can be used.
     allotment = get_active_missed_bus_allotment(db, student.id)
     target_bus_id = get_current_bus_id(student, db)
     if not target_bus_id:
@@ -3422,6 +3456,10 @@ def create_wait_request(
     )
     if not trip:
         raise HTTPException(status_code=400, detail="No active bus trip right now")
+
+    stop, temp_change = get_effective_student_stop(db, student, trip.trip_type)
+    if not stop:
+        raise HTTPException(status_code=404, detail="Assigned stop not found")
 
     if has_passed_stop(db, trip, stop):
         raise HTTPException(status_code=400, detail="The bus has already passed your stop")
@@ -4022,7 +4060,7 @@ def get_driver_route_stops(
     # 1. Fetch active route stops (excluding soft-deleted / inactive custom stops)
     regular_stops = (
         db.query(Stop)
-        .filter(Stop.route_id == bus.route_id, Stop.is_active == True)
+        .filter(Stop.route_id == bus.route_id, Stop.is_active == True, Stop.is_custom == False)
         .order_by(Stop.stop_order.asc())
         .all()
     )
@@ -4050,7 +4088,9 @@ def get_driver_route_stops(
     for s in boarding_students:
         if s.id not in not_travelling_ids:
             total_expected_today += 1
-            eff_stop, _ = get_effective_student_stop(db, s)
+            eff_stop, _ = get_effective_student_stop(
+                db, s, active_trip.trip_type if active_trip else None
+            )
             if eff_stop and eff_stop.is_active:
                 stop_student_counts[eff_stop.id] = stop_student_counts.get(eff_stop.id, 0) + 1
                 if eff_stop.id not in stops_by_id:
@@ -5482,7 +5522,11 @@ def get_affected_students(target_type: str, target_id: int | None, db: Session):
     elif target_type == "stop":
         affected = []
         for student in students:
-            stop, _ = get_effective_student_stop(db, student)
+            current_bus_id = get_current_bus_id(student, db)
+            active_trip = get_active_trip_for_bus(db, current_bus_id) if current_bus_id else None
+            stop, _ = get_effective_student_stop(
+                db, student, active_trip.trip_type if active_trip else None
+            )
             if stop and stop.id == target_id:
                 affected.append(student)
         return affected
