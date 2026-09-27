@@ -37,6 +37,7 @@ from models import (
     ComplaintVerification,
     AdminActivityLog,
     AnnouncementHistory,
+    AdminBusChange,
     StudentOTP,
     MissedBusAllotment,
     TemporaryStopChange
@@ -67,6 +68,7 @@ from schemas import (
     AdminAssignBusRouteRequest,
     AdminCalculateRecipientsRequest,
     AdminBroadcastAnnouncementRequest,
+    AdminBusChangeCreate,
     AdminDriverCreate,
     AdminDriverUpdate,
     AdminStudentCreate,
@@ -263,6 +265,7 @@ def initialize_trip_database():
         ComplaintVerification,
         AdminActivityLog,
         AnnouncementHistory,
+        AdminBusChange,
         StudentOTP,
         MissedBusAllotment,
         TemporaryStopChange,
@@ -277,6 +280,7 @@ def initialize_trip_database():
     ComplaintVerification.__table__.create(bind=engine, checkfirst=True)
     AdminActivityLog.__table__.create(bind=engine, checkfirst=True)
     AnnouncementHistory.__table__.create(bind=engine, checkfirst=True)
+    AdminBusChange.__table__.create(bind=engine, checkfirst=True)
     StudentOTP.__table__.create(bind=engine, checkfirst=True)
     MissedBusAllotment.__table__.create(bind=engine, checkfirst=True)
     TemporaryStopChange.__table__.create(bind=engine, checkfirst=True)
@@ -760,7 +764,8 @@ def verify_driver_complaint(
     if complaint.student_id == student.id:
         raise HTTPException(status_code=400, detail="You cannot verify your own complaint")
 
-    if student.bus_id != complaint.bus_id:
+    current_bus_id = get_current_bus_id(student, db)
+    if current_bus_id != complaint.bus_id:
         raise HTTPException(status_code=403, detail="This complaint is not related to your bus")
 
     existing_verification = (
@@ -1430,10 +1435,11 @@ def create_driver_complaint(
     if data.reason == "other" and (not data.description or not data.description.strip()):
         raise HTTPException(status_code=400, detail="Please provide a description for this complaint")
 
-    if not student.bus_id:
+    current_bus_id = get_current_bus_id(student, db)
+    if not current_bus_id:
         raise HTTPException(status_code=400, detail="You are not assigned to a bus")
 
-    bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
+    bus = db.query(Bus).filter(Bus.id == current_bus_id).first()
     if not bus:
         raise HTTPException(status_code=404, detail="Assigned bus not found")
 
@@ -2585,6 +2591,33 @@ def get_active_missed_bus_allotment(db: Session, student_id: int):
     return None
 
 
+def get_active_admin_bus_change(db: Session, bus_id: int | None):
+    if not bus_id:
+        return None
+
+    today = date.today()
+    changes = (
+        db.query(AdminBusChange)
+        .filter(
+            AdminBusChange.source_bus_id == bus_id,
+            AdminBusChange.status == "active",
+        )
+        .order_by(AdminBusChange.created_at.desc())
+        .all()
+    )
+
+    expired_changes = [change for change in changes if today > change.end_date]
+    for change in expired_changes:
+        change.status = "expired"
+    if expired_changes:
+        db.commit()
+
+    for change in changes:
+        if change.status == "active" and change.start_date <= today <= change.end_date:
+            return change
+    return None
+
+
 def get_current_bus_id(student: Student, db: Session) -> int | None:
     """Resolve the bus the student is travelling on right now.
 
@@ -2594,13 +2627,16 @@ def get_current_bus_id(student: Student, db: Session) -> int | None:
     """
     allotment = get_active_missed_bus_allotment(db, student.id)
     if allotment and allotment.alternative_bus_id:
-        return allotment.alternative_bus_id
+        resolved_bus_id = allotment.alternative_bus_id
+    else:
+        temp_change = get_active_temporary_stop_change(db, student.id)
+        if temp_change and temp_change.target_bus_id:
+            resolved_bus_id = temp_change.target_bus_id
+        else:
+            resolved_bus_id = student.bus_id
 
-    temp_change = get_active_temporary_stop_change(db, student.id)
-    if temp_change and temp_change.target_bus_id:
-        return temp_change.target_bus_id
-
-    return student.bus_id
+    admin_change = get_active_admin_bus_change(db, resolved_bus_id)
+    return admin_change.target_bus_id if admin_change else resolved_bus_id
 
 
 def get_students_for_current_bus(db: Session, bus_id: int) -> list[Student]:
@@ -2905,7 +2941,8 @@ def check_temporary_stop_route(
     student = db.query(Student).filter(Student.user_id == current_student["user_id"]).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student profile not found")
-    current_bus = db.query(Bus).filter(Bus.id == student.bus_id).first() if student.bus_id else None
+    current_bus_id = get_current_bus_id(student, db)
+    current_bus = db.query(Bus).filter(Bus.id == current_bus_id).first() if current_bus_id else None
     if not current_bus or not current_bus.route_id:
         raise HTTPException(status_code=400, detail="Your assigned bus has no route")
     route = db.query(Route).filter(Route.id == current_bus.route_id).first()
@@ -2933,7 +2970,7 @@ def check_temporary_stop_route(
                 "is_approximate_match": data.stop_id is None, "candidate_buses": []}
 
     candidates, is_approximate, _ = find_candidate_buses_for_location(
-        db, data.stop_id, data.latitude, data.longitude, student_bus_id=student.bus_id)
+        db, data.stop_id, data.latitude, data.longitude, student_bus_id=current_bus_id)
 
     own_bus_found = any(c.get("is_own_bus") for c in candidates)
     if own_bus_found:
@@ -5500,6 +5537,133 @@ def get_announcement_history(
             "created_at": r.created_at.isoformat() + "Z" if r.created_at else None
         })
     return {"announcements": result}
+
+
+@app.post("/admin/bus-changes", status_code=201)
+def create_admin_bus_change(
+    data: AdminBusChangeCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    source_bus = db.query(Bus).filter(Bus.id == data.source_bus_id).first()
+    target_bus = db.query(Bus).filter(Bus.id == data.target_bus_id).first()
+    if not source_bus:
+        raise HTTPException(status_code=404, detail="Source bus not found")
+    if not target_bus:
+        raise HTTPException(status_code=404, detail="Target bus not found")
+    if data.source_bus_id == data.target_bus_id:
+        raise HTTPException(status_code=400, detail="Source and target bus must differ")
+
+    students = get_affected_students("bus", data.source_bus_id, db)
+
+    change = AdminBusChange(
+        source_bus_id=data.source_bus_id,
+        target_bus_id=data.target_bus_id,
+        start_date=data.start_date,
+        end_date=data.end_date,
+        status="active",
+        created_by=current_user["user_id"],
+        created_at=datetime.utcnow(),
+    )
+    db.add(change)
+    db.commit()
+    db.refresh(change)
+
+    recipients_count = len(students)
+    for st in students:
+        send_notification(
+            db=db,
+            user_id=st.user_id,
+            title=data.title,
+            message=data.message,
+            notification_type="announcement",
+            data={
+                "template_type": data.template_type,
+                "target_type": "bus",
+                "target_id": data.source_bus_id,
+                "bus_change_id": change.id,
+            },
+        )
+        try:
+            notification_manager.push_notification_sync(st.user_id, {
+                "type": "announcement",
+                "title": data.title,
+                "message": data.message,
+                "template_type": data.template_type,
+            })
+        except Exception as ws_err:
+            logger.warning(f"Announcement WS push failed for user {st.user_id}: {ws_err}")
+
+    history = AnnouncementHistory(
+        sender_id=current_user["user_id"],
+        template_type=data.template_type,
+        title=data.title,
+        message=data.message,
+        target_type="bus",
+        target_id=data.source_bus_id,
+        recipient_count=recipients_count,
+    )
+    db.add(history)
+    db.commit()
+    db.refresh(history)
+
+    change.announcement_id = history.id
+    db.commit()
+
+    log_admin_activity(
+        db, current_user["user_id"], "CREATE_BUS_CHANGE", "admin_bus_change", str(change.id),
+        f"Reassigned Bus {source_bus.bus_number} riders to Bus {target_bus.bus_number} "
+        f"from {data.start_date} to {data.end_date} ({recipients_count} students)"
+    )
+
+    return {
+        "success": True,
+        "message": f"{recipients_count} students on Bus {source_bus.bus_number} reassigned to Bus {target_bus.bus_number} for {data.start_date} to {data.end_date}",
+        "bus_change_id": change.id,
+        "recipient_count": recipients_count,
+        "history_id": history.id,
+    }
+
+
+@app.get("/admin/bus-changes")
+def list_admin_bus_changes(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    changes = db.query(AdminBusChange).order_by(AdminBusChange.created_at.desc()).limit(50).all()
+    result = []
+    for c in changes:
+        get_active_admin_bus_change(db, c.source_bus_id)
+        db.refresh(c)
+        source = db.query(Bus).filter(Bus.id == c.source_bus_id).first()
+        target = db.query(Bus).filter(Bus.id == c.target_bus_id).first()
+        result.append({
+            "id": c.id,
+            "source_bus_number": source.bus_number if source else None,
+            "target_bus_number": target.bus_number if target else None,
+            "start_date": c.start_date.isoformat(),
+            "end_date": c.end_date.isoformat(),
+            "status": c.status,
+            "created_at": to_utc_iso(c.created_at),
+        })
+    return {"bus_changes": result}
+
+
+@app.post("/admin/bus-changes/{change_id}/cancel")
+def cancel_admin_bus_change(
+    change_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    change = db.query(AdminBusChange).filter(AdminBusChange.id == change_id).first()
+    if not change:
+        raise HTTPException(status_code=404, detail="Bus change not found")
+    if change.status != "active":
+        raise HTTPException(status_code=400, detail="This bus change is not active")
+    change.status = "cancelled"
+    db.commit()
+    log_admin_activity(db, current_user["user_id"], "CANCEL_BUS_CHANGE", "admin_bus_change", str(change_id), "Cancelled bus change early")
+    return {"success": True, "message": "Bus change cancelled and reverted immediately"}
 
 
 # ------------------------------------------------------------

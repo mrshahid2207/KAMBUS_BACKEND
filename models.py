@@ -422,6 +422,20 @@ class AnnouncementHistory(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class AdminBusChange(Base):
+    __tablename__ = "admin_bus_changes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    source_bus_id = Column(Integer, ForeignKey("buses.id"), nullable=False, index=True)
+    target_bus_id = Column(Integer, ForeignKey("buses.id"), nullable=False)
+    start_date = Column(Date, nullable=False, index=True)
+    end_date = Column(Date, nullable=False, index=True)
+    status = Column(String(20), default="active", nullable=False, index=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    announcement_id = Column(Integer, ForeignKey("announcement_history.id"), nullable=True)
+
+
 class StudentOTP(Base):
     __tablename__ = "student_otps"
 
