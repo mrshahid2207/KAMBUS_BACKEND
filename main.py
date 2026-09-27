@@ -4654,6 +4654,16 @@ def admin_delete_driver(driver_id: int, db: Session = Depends(get_db), current_u
 
     user = db.query(User).filter(User.id == driver.user_id).first()
     code = driver.driver_code
+    active_trip = db.query(Trip).filter(
+        Trip.driver_id == driver.id,
+        Trip.status == "active"
+    ).first()
+    if active_trip:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete or deactivate a driver who is currently on an active trip"
+        )
+
     referenced = db.query(Trip).filter(Trip.driver_id == driver.id).first()
     if referenced is None:
         referenced = db.query(DriverComplaint).filter(DriverComplaint.driver_id == driver.id).first()
