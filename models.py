@@ -75,6 +75,8 @@ class Stop(Base):
     name = Column(String(100), nullable=False)
     latitude = Column(Float, nullable=False)
     longitude = Column(Float, nullable=False)
+    evening_latitude = Column(Float, nullable=True)
+    evening_longitude = Column(Float, nullable=True)
     stop_order = Column(Integer, nullable=False)
 
     # Temporary map-selected stop support
