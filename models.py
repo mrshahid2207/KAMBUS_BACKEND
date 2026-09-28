@@ -35,8 +35,8 @@ class Student(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     roll_number = Column(String(50), unique=True, nullable=False)
     department = Column(String(100))
-    bus_id = Column(Integer, ForeignKey("buses.id"), nullable=True)
-    stop_id = Column(Integer, ForeignKey("stops.id"), nullable=True)
+    bus_id = Column(Integer, ForeignKey("buses.id", ondelete="SET NULL"), nullable=True)
+    stop_id = Column(Integer, ForeignKey("stops.id", ondelete="SET NULL"), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
 
 
@@ -64,9 +64,10 @@ class Bus(Base):
     id = Column(Integer, primary_key=True, index=True)
     bus_number = Column(String(50), unique=True, nullable=False)
     route_id = Column(Integer, ForeignKey("routes.id"), nullable=True)
-    driver_id = Column(Integer, ForeignKey("drivers.id"), nullable=True)
+    driver_id = Column(Integer, ForeignKey("drivers.id", ondelete="SET NULL"), nullable=True)
     registration_number = Column(String(50))
     status = Column(String(30), default="active")
+    is_active = Column(Boolean, default=True, nullable=False, server_default="true")
 
 
 class Stop(Base):
@@ -91,7 +92,7 @@ class BusLocation(Base):
     __tablename__ = "bus_locations"
 
     id = Column(Integer, primary_key=True, index=True)
-    bus_id = Column(Integer, ForeignKey("buses.id"), nullable=False)
+    bus_id = Column(Integer, ForeignKey("buses.id", ondelete="CASCADE"), nullable=False)
     trip_id = Column(Integer, ForeignKey("trips.id"), nullable=True)
 
     latitude = Column(Float, nullable=False)
@@ -107,14 +108,14 @@ class Trip(Base):
 
     bus_id = Column(
         Integer,
-        ForeignKey("buses.id"),
-        nullable=False
+        ForeignKey("buses.id", ondelete="SET NULL"),
+        nullable=True
     )
 
     driver_id = Column(
         Integer,
-        ForeignKey("drivers.id"),
-        nullable=False
+        ForeignKey("drivers.id", ondelete="SET NULL"),
+        nullable=True
     )
 
     route_id = Column(
@@ -178,8 +179,8 @@ class WaitRequest(Base):
 
     bus_id = Column(
         Integer,
-        ForeignKey("buses.id"),
-        nullable=False
+        ForeignKey("buses.id", ondelete="SET NULL"),
+        nullable=True
     )
 
     trip_id = Column(
@@ -191,7 +192,7 @@ class WaitRequest(Base):
 
     stop_id = Column(
         Integer,
-        ForeignKey("stops.id"),
+        ForeignKey("stops.id", ondelete="SET NULL"),
         nullable=True,
         index=True
     )
@@ -249,13 +250,13 @@ class Notification(Base):
     __tablename__ = "notifications"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     title = Column(String(160), nullable=False)
     message = Column(String(500), nullable=False)
     type = Column(String(40), nullable=False, default="system")
     is_read = Column(Integer, nullable=False, default=0)
     payload = Column(String, nullable=True)
-    related_bus_id = Column(Integer, ForeignKey("buses.id"), nullable=True)
+    related_bus_id = Column(Integer, ForeignKey("buses.id", ondelete="SET NULL"), nullable=True)
     related_trip_id = Column(Integer, ForeignKey("trips.id"), nullable=True)
     related_wait_request_id = Column(Integer, ForeignKey("wait_requests.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -265,7 +266,7 @@ class DeviceToken(Base):
     __tablename__ = "device_tokens"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     token = Column(String(512), unique=True, nullable=False)
     platform = Column(String(30), nullable=False, default="android")
     is_active = Column(Integer, nullable=False, default=1)
@@ -280,8 +281,8 @@ class BusEntryLog(Base):
 
     bus_id = Column(
         Integer,
-        ForeignKey("buses.id"),
-        nullable=False
+        ForeignKey("buses.id", ondelete="SET NULL"),
+        nullable=True
     )
 
     trip_id = Column(
@@ -324,14 +325,14 @@ class DriverComplaint(Base):
 
     driver_id = Column(
         Integer,
-        ForeignKey("drivers.id"),
-        nullable=False
+        ForeignKey("drivers.id", ondelete="SET NULL"),
+        nullable=True
     )
 
     bus_id = Column(
         Integer,
-        ForeignKey("buses.id"),
-        nullable=False
+        ForeignKey("buses.id", ondelete="SET NULL"),
+        nullable=True
     )
 
     trip_id = Column(
@@ -426,8 +427,8 @@ class AdminBusChange(Base):
     __tablename__ = "admin_bus_changes"
 
     id = Column(Integer, primary_key=True, index=True)
-    source_bus_id = Column(Integer, ForeignKey("buses.id"), nullable=False, index=True)
-    target_bus_id = Column(Integer, ForeignKey("buses.id"), nullable=False)
+    source_bus_id = Column(Integer, ForeignKey("buses.id", ondelete="SET NULL"), nullable=True, index=True)
+    target_bus_id = Column(Integer, ForeignKey("buses.id", ondelete="SET NULL"), nullable=True)
     start_date = Column(Date, nullable=False, index=True)
     end_date = Column(Date, nullable=False, index=True)
     status = Column(String(20), default="active", nullable=False, index=True)
@@ -454,11 +455,11 @@ class MissedBusAllotment(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     student_id = Column(Integer, ForeignKey("students.id"), nullable=False, index=True)
-    original_bus_id = Column(Integer, ForeignKey("buses.id"), nullable=False)
-    alternative_bus_id = Column(Integer, ForeignKey("buses.id"), nullable=False)
+    original_bus_id = Column(Integer, ForeignKey("buses.id", ondelete="SET NULL"), nullable=True)
+    alternative_bus_id = Column(Integer, ForeignKey("buses.id", ondelete="SET NULL"), nullable=True)
     original_trip_id = Column(Integer, ForeignKey("trips.id"), nullable=True)
     alternative_trip_id = Column(Integer, ForeignKey("trips.id"), nullable=True)
-    stop_id = Column(Integer, ForeignKey("stops.id"), nullable=False)
+    stop_id = Column(Integer, ForeignKey("stops.id", ondelete="SET NULL"), nullable=True)
     status = Column(String(20), default="active", nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     expires_at = Column(DateTime, nullable=True)
@@ -469,12 +470,12 @@ class TemporaryStopChange(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     student_id = Column(Integer, ForeignKey("students.id"), nullable=False, index=True)
-    original_stop_id = Column(Integer, ForeignKey("stops.id"), nullable=False)
-    temporary_stop_id = Column(Integer, ForeignKey("stops.id"), nullable=False)
+    original_stop_id = Column(Integer, ForeignKey("stops.id", ondelete="SET NULL"), nullable=True)
+    temporary_stop_id = Column(Integer, ForeignKey("stops.id", ondelete="SET NULL"), nullable=True)
     # Direction-specific stops. Legacy rows retain ``temporary_stop_id`` and
     # are backfilled to both columns by the accompanying migration.
-    morning_temporary_stop_id = Column(Integer, ForeignKey("stops.id"), nullable=True)
-    evening_temporary_stop_id = Column(Integer, ForeignKey("stops.id"), nullable=True)
+    morning_temporary_stop_id = Column(Integer, ForeignKey("stops.id", ondelete="SET NULL"), nullable=True)
+    evening_temporary_stop_id = Column(Integer, ForeignKey("stops.id", ondelete="SET NULL"), nullable=True)
     start_date = Column(Date, nullable=False, index=True)
     end_date = Column(Date, nullable=False, index=True)
     status = Column(String(20), default="scheduled", nullable=False, index=True)
@@ -486,6 +487,6 @@ class TemporaryStopChange(Base):
     selected_address = Column(String(255), nullable=True)
 
     # Multi-bus assignment & proximity matching details
-    target_bus_id = Column(Integer, ForeignKey("buses.id"), nullable=True)
+    target_bus_id = Column(Integer, ForeignKey("buses.id", ondelete="SET NULL"), nullable=True)
     is_approximate_match = Column(Boolean, default=False, nullable=True)
     match_distance_m = Column(Float, nullable=True)

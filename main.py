@@ -237,6 +237,18 @@ async def websocket_notifications(
     try:
         user_payload = get_user_from_token(token)
         user_id = user_payload["user_id"]
+        db = SessionLocal()
+        try:
+            if user_payload["role"] == "driver":
+                profile = db.query(Driver).filter(Driver.user_id == user_id).first()
+                if not profile or not profile.is_active:
+                    raise HTTPException(status_code=403, detail="This driver account has been deactivated")
+            elif user_payload["role"] == "student":
+                profile = db.query(Student).filter(Student.user_id == user_id).first()
+                if not profile or not profile.is_active:
+                    raise HTTPException(status_code=403, detail="This student account has been deactivated")
+        finally:
+            db.close()
     except Exception:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
@@ -269,7 +281,8 @@ def initialize_trip_database():
         StudentOTP,
         MissedBusAllotment,
         TemporaryStopChange,
-        Stop
+        Stop,
+        Bus,
     )
 
     # 1. Ensure all core tables exist
@@ -382,6 +395,7 @@ def initialize_trip_database():
                     connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN match_distance_m FLOAT"))
                 except Exception:
                     pass
+
             if "morning_temporary_stop_id" not in temp_cols:
                 try:
                     connection.execute(text("ALTER TABLE temporary_stop_changes ADD COLUMN morning_temporary_stop_id INTEGER REFERENCES stops(id)"))
@@ -405,6 +419,25 @@ def initialize_trip_database():
                 """))
             except Exception:
                 pass
+
+    if inspector.has_table("buses"):
+        bus_cols = {col["name"] for col in inspector.get_columns("buses")}
+        if "is_active" not in bus_cols:
+            with engine.begin() as connection:
+                try:
+                    connection.execute(text("ALTER TABLE buses ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+                    connection.execute(text("UPDATE buses SET is_active = FALSE WHERE status = 'inactive'"))
+                except Exception:
+                    pass
+
+    if inspector.has_table("drivers"):
+        driver_cols = {col["name"] for col in inspector.get_columns("drivers")}
+        if "is_active" not in driver_cols:
+            with engine.begin() as connection:
+                try:
+                    connection.execute(text("ALTER TABLE drivers ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT TRUE"))
+                except Exception:
+                    pass
 
 
 # The production startup event repeats this idempotent check. Running it here
@@ -445,6 +478,8 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def get_active_trip_for_bus(db: Session, bus_id: int):
+    if not bus_id:
+        return None
     return (
         db.query(Trip)
         .filter(Trip.bus_id == bus_id, Trip.status == "active")
@@ -453,7 +488,20 @@ def get_active_trip_for_bus(db: Session, bus_id: int):
     )
 
 
+def get_active_bus_for_driver(db: Session, driver: Driver) -> Bus | None:
+    """Return the driver's currently usable bus, never a deactivated one."""
+    if not driver or not driver.id:
+        return None
+    return (
+        db.query(Bus)
+        .filter(Bus.driver_id == driver.id, Bus.is_active == True)
+        .first()
+    )
+
+
 def get_latest_location(db: Session, bus_id: int, trip_id: int | None = None):
+    if not bus_id:
+        return None
     query = db.query(BusLocation).filter(BusLocation.bus_id == bus_id)
     if trip_id is not None:
         query = query.filter(BusLocation.trip_id == trip_id)
@@ -1306,13 +1354,13 @@ def get_student_onboarding_status(
 
     user = db.query(User).filter(User.id == student.user_id).first()
 
-    bus = db.query(Bus).filter(Bus.id == student.bus_id).first() if student.bus_id else None
+    bus = db.query(Bus).filter(Bus.id == student.bus_id, Bus.is_active == True).first() if student.bus_id else None
     route = db.query(Route).filter(Route.id == bus.route_id).first() if (bus and bus.route_id) else None
-    assigned_stop = db.query(Stop).filter(Stop.id == student.stop_id).first() if student.stop_id else None
+    assigned_stop = db.query(Stop).filter(Stop.id == student.stop_id, Stop.is_active == True).first() if student.stop_id else None
 
     available_stops = []
     if bus and bus.route_id:
-        stops = db.query(Stop).filter(Stop.route_id == bus.route_id).order_by(Stop.stop_order.asc()).all()
+        stops = db.query(Stop).filter(Stop.route_id == bus.route_id, Stop.is_active == True).order_by(Stop.stop_order.asc()).all()
         available_stops = [
             {
                 "stop_id": s.id,
@@ -1336,7 +1384,7 @@ def get_student_onboarding_status(
         "stop_id": assigned_stop.id if assigned_stop else None,
         "stop_name": assigned_stop.name if assigned_stop else None,
         "available_stops": available_stops,
-        "is_completed": student.stop_id is not None
+        "is_completed": assigned_stop is not None
     }
 
 
@@ -1356,14 +1404,14 @@ def student_select_pickup_stop(
             detail="Your bus has not been assigned yet. Please contact the transport administrator."
         )
 
-    bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
+    bus = db.query(Bus).filter(Bus.id == student.bus_id, Bus.is_active == True).first()
     if not bus or not bus.route_id:
         raise HTTPException(
             status_code=400,
             detail="Your assigned bus does not have an active route. Please contact the transport administrator."
         )
 
-    stop = db.query(Stop).filter(Stop.id == data.stop_id).first()
+    stop = db.query(Stop).filter(Stop.id == data.stop_id, Stop.is_active == True).first()
     if not stop:
         raise HTTPException(status_code=404, detail="Selected pickup stop not found")
 
@@ -1644,11 +1692,8 @@ def update_bus_location(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    bus = db.query(Bus).filter(Bus.id == bus_id).first()
-    if not bus:
-        raise HTTPException(status_code=404, detail="Bus not found")
-
-    if bus.driver_id != driver.id:
+    bus = get_active_bus_for_driver(db, driver)
+    if not bus or bus.id != bus_id:
         raise HTTPException(status_code=403, detail="You are not assigned to this bus")
 
     active_trip = (
@@ -1701,10 +1746,10 @@ def update_bus_location(
             db.commit()
             db.refresh(entry_log)
 
+    # Proximity notifications must follow active temporary morning/evening stops,
+    # rather than the student's permanent stop assignment.
     for student in get_students_for_current_bus(db, bus.id):
-        if student.stop_id is None:
-            continue
-        stop = db.query(Stop).filter(Stop.id == student.stop_id).first()
+        stop, _ = get_effective_student_stop(db, student, active_trip.trip_type)
         if not stop:
             continue
 
@@ -1767,7 +1812,8 @@ def get_bus_location(
 
     elif current_user["role"] == "driver":
         driver = db.query(Driver).filter(Driver.user_id == current_user["user_id"]).first()
-        if not driver or not db.query(Bus).filter(Bus.id == bus_id, Bus.driver_id == driver.id).first():
+        assigned_bus = get_active_bus_for_driver(db, driver) if driver else None
+        if not assigned_bus or assigned_bus.id != bus_id:
             raise HTTPException(status_code=403, detail="You are not assigned to this bus")
 
     elif current_user["role"] not in ("admin", "super_admin"):
@@ -1945,7 +1991,7 @@ def add_driver_stop(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    bus = db.query(Bus).filter(Bus.driver_id == driver.id).first()
+    bus = db.query(Bus).filter(Bus.driver_id == driver.id, Bus.is_active == True).first()
     if not bus:
         raise HTTPException(status_code=404, detail="No bus assigned to this driver")
 
@@ -1994,7 +2040,7 @@ def get_my_bus(
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
     user = db.query(User).filter(User.id == driver.user_id).first()
-    bus = db.query(Bus).filter(Bus.driver_id == driver.id).first()
+    bus = get_active_bus_for_driver(db, driver)
     if not bus:
         raise HTTPException(status_code=404, detail="No bus assigned to this driver")
 
@@ -2025,7 +2071,7 @@ def get_student_route_stops(
 
     target_bus_id = get_current_bus_id(student, db)
 
-    bus = db.query(Bus).filter(Bus.id == target_bus_id).first()
+    bus = db.query(Bus).filter(Bus.id == target_bus_id, Bus.is_active == True).first()
     if not bus:
         raise HTTPException(status_code=404, detail="Assigned bus not found")
     if bus.route_id is None:
@@ -2079,9 +2125,7 @@ def get_all_bus_routes(
     current_student: dict = Depends(require_student),
 ):
     """Read-only reference: every active bus with its route name and ordered stops."""
-    buses = db.query(Bus).filter(Bus.status == "active").order_by(Bus.bus_number.asc()).all()
-    if not buses:
-        buses = db.query(Bus).order_by(Bus.bus_number.asc()).all()
+    buses = db.query(Bus).filter(Bus.status == "active", Bus.is_active == True).order_by(Bus.bus_number.asc()).all()
 
     result = []
     for bus in buses:
@@ -2444,9 +2488,7 @@ def find_candidate_buses_for_location(
     require_active_trip : only return buses with an active trip (used by
                           Missed Bus, whose allotments require one).
     """
-    buses = db.query(Bus).filter(Bus.status == "active").all()
-    if not buses:
-        buses = db.query(Bus).all()
+    buses = db.query(Bus).filter(Bus.status == "active", Bus.is_active == True).all()
 
     candidates = []
     global_min_dist = float("inf")
@@ -2466,7 +2508,7 @@ def find_candidate_buses_for_location(
         is_match = False
 
         if stop_id is not None:
-            st = db.query(Stop).filter(Stop.id == stop_id).first()
+            st = db.query(Stop).filter(Stop.id == stop_id, Stop.is_active == True).first()
             if st:
                 if st.route_id == bus.route_id:
                     is_match = True
@@ -2623,7 +2665,7 @@ def get_effective_student_stop(db: Session, student: Student, trip_type: str | N
             return temp_stop, temp_change
 
     original_stop = (
-        db.query(Stop).filter(Stop.id == student.stop_id).first()
+        db.query(Stop).filter(Stop.id == student.stop_id, Stop.is_active == True).first()
         if student.stop_id
         else None
     )
@@ -2694,25 +2736,42 @@ def get_current_bus_id(student: Student, db: Session) -> int | None:
     change. Future-dated temporary changes are excluded by
     get_active_temporary_stop_change().
     """
-    allotment = get_active_missed_bus_allotment(db, student.id)
-    if allotment and allotment.alternative_bus_id:
-        resolved_bus_id = allotment.alternative_bus_id
-    else:
-        temp_change = get_active_temporary_stop_change(db, student.id)
-        if temp_change and temp_change.target_bus_id:
-            resolved_bus_id = temp_change.target_bus_id
-        else:
-            resolved_bus_id = student.bus_id
+    def active_bus_id(bus_id: int | None) -> int | None:
+        if not bus_id:
+            return None
+        return bus_id if db.query(Bus.id).filter(Bus.id == bus_id, Bus.is_active == True).first() else None
 
-    admin_change = get_active_admin_bus_change(db, resolved_bus_id)
-    return admin_change.target_bus_id if admin_change else resolved_bus_id
+    # The permanent assignment is the only safe fallback when a temporary,
+    # missed-bus, or admin-change target has since been deactivated.
+    permanent_bus_id = active_bus_id(student.bus_id)
+    allotment = get_active_missed_bus_allotment(db, student.id)
+    temp_change = get_active_temporary_stop_change(db, student.id)
+    candidate_bus_ids = [
+        allotment.alternative_bus_id if allotment else None,
+        temp_change.target_bus_id if temp_change else None,
+        permanent_bus_id,
+    ]
+
+    for candidate_bus_id in candidate_bus_ids:
+        active_candidate_id = active_bus_id(candidate_bus_id)
+        if not active_candidate_id:
+            continue
+        admin_change = get_active_admin_bus_change(db, active_candidate_id)
+        if not admin_change:
+            return active_candidate_id
+        active_target_id = active_bus_id(admin_change.target_bus_id)
+        return active_target_id or permanent_bus_id
+
+    return None
 
 
 def get_students_for_current_bus(db: Session, bus_id: int) -> list[Student]:
     """Return students whose computed current assignment is ``bus_id``."""
+    if not bus_id:
+        return []
     return [
         student
-        for student in db.query(Student).all()
+        for student in db.query(Student).filter(Student.is_active == True).all()
         if get_current_bus_id(student, db) == bus_id
     ]
 
@@ -2798,7 +2857,7 @@ def get_student_my_stop(
         raise HTTPException(status_code=404, detail="No stop assigned to this student")
 
     target_bus_id = get_current_bus_id(student, db)
-    bus = db.query(Bus).filter(Bus.id == target_bus_id).first()
+    bus = db.query(Bus).filter(Bus.id == target_bus_id, Bus.is_active == True).first()
     active_trip = get_active_trip_for_bus(db, target_bus_id) if target_bus_id else None
     stop, temp_change = get_effective_student_stop(
         db, student, active_trip.trip_type if active_trip else None
@@ -2866,7 +2925,7 @@ def automatically_allot_alternative_bus(
         }
 
     current_bus_id = get_current_bus_id(student, db)
-    original_bus = db.query(Bus).filter(Bus.id == current_bus_id).first()
+    original_bus = db.query(Bus).filter(Bus.id == current_bus_id, Bus.is_active == True).first()
     if not original_bus:
         raise HTTPException(status_code=404, detail="Current bus could not be found")
 
@@ -3058,7 +3117,7 @@ def check_temporary_stop_route(
     if not student:
         raise HTTPException(status_code=404, detail="Student profile not found")
     current_bus_id = get_current_bus_id(student, db)
-    current_bus = db.query(Bus).filter(Bus.id == current_bus_id).first() if current_bus_id else None
+    current_bus = db.query(Bus).filter(Bus.id == current_bus_id, Bus.is_active == True).first() if current_bus_id else None
     if not current_bus or not current_bus.route_id:
         raise HTTPException(status_code=400, detail="Your assigned bus has no route")
     route = db.query(Route).filter(Route.id == current_bus.route_id).first()
@@ -3070,7 +3129,7 @@ def check_temporary_stop_route(
 
     match_distance_m = None
     if data.stop_id is not None:
-        selected_stop = db.query(Stop).filter(Stop.id == data.stop_id).first()
+        selected_stop = db.query(Stop).filter(Stop.id == data.stop_id, Stop.is_active == True).first()
         if not selected_stop:
             raise HTTPException(status_code=404, detail="Selected stop not found")
         on_route = selected_stop.route_id == current_bus.route_id
@@ -3124,8 +3183,8 @@ def create_temporary_stop_change(
     if (data.end_date - data.start_date).days > 30:
         raise HTTPException(status_code=400, detail="Temporary stop changes can be scheduled for at most 31 days")
 
-    original_bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
-    original_stop = db.query(Stop).filter(Stop.id == student.stop_id).first()
+    original_bus = db.query(Bus).filter(Bus.id == student.bus_id, Bus.is_active == True).first()
+    original_stop = db.query(Stop).filter(Stop.id == student.stop_id, Stop.is_active == True).first()
     if not original_bus or not original_stop:
         raise HTTPException(status_code=404, detail="Bus or stop not found")
     if original_bus.route_id is None:
@@ -3146,7 +3205,7 @@ def create_temporary_stop_change(
 
     # Both directional locations must be served by one bus. The legacy request
     # shape resolves to the same input for each direction, preserving old clients.
-    candidate_buses = db.query(Bus).filter(Bus.status == "active").all()
+    candidate_buses = db.query(Bus).filter(Bus.status == "active", Bus.is_active == True).all()
     matching_buses = [
         bus for bus in candidate_buses
         if _temporary_stop_input_matches_bus(db, morning_input, bus)
@@ -3542,7 +3601,7 @@ def create_wait_request(
     db.commit()
     db.refresh(wait_request)
 
-    bus = db.query(Bus).filter(Bus.id == target_bus_id).first()
+    bus = db.query(Bus).filter(Bus.id == target_bus_id, Bus.is_active == True).first()
     driver = db.query(Driver).filter(Driver.id == bus.driver_id).first() if bus and bus.driver_id else None
 
     if driver:
@@ -3649,7 +3708,7 @@ def get_driver_wait_requests(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    bus = db.query(Bus).filter(Bus.driver_id == driver.id).first()
+    bus = get_active_bus_for_driver(db, driver)
     if not bus:
         raise HTTPException(status_code=404, detail="No bus assigned to this driver")
 
@@ -3850,7 +3909,7 @@ def accept_wait_request(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    bus = db.query(Bus).filter(Bus.driver_id == driver.id).first()
+    bus = get_active_bus_for_driver(db, driver)
     if not bus:
         raise HTTPException(status_code=404, detail="No bus assigned to this driver")
 
@@ -3910,7 +3969,7 @@ def reject_wait_request(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    bus = db.query(Bus).filter(Bus.driver_id == driver.id).first()
+    bus = get_active_bus_for_driver(db, driver)
     if not bus:
         raise HTTPException(status_code=404, detail="No bus assigned to this driver")
 
@@ -4042,7 +4101,7 @@ def get_driver_route_stops(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    bus = db.query(Bus).filter(Bus.driver_id == driver.id).first()
+    bus = get_active_bus_for_driver(db, driver)
     if not bus:
         raise HTTPException(status_code=404, detail="No bus assigned to this driver")
 
@@ -4241,6 +4300,7 @@ def admin_bus_payload(bus: Bus, db: Session):
     return {
         "bus_id": bus.id,
         "bus_number": bus.bus_number,
+        "is_active": bool(getattr(bus, "is_active", bus.status == "active")),
         "registration_number": bus.registration_number,
         "status": bus.status,
         "route_id": bus.route_id,
@@ -4430,8 +4490,19 @@ def get_admin_dashboard(db: Session = Depends(get_db), current_user: dict = Depe
 # ------------------------------------------------------------
 
 @app.get("/admin/buses")
-def list_admin_buses(db: Session = Depends(get_db), current_user: dict = Depends(require_admin)):
-    buses = db.query(Bus).order_by(Bus.bus_number.asc()).all()
+def list_admin_buses(
+    status: str = "active",
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    if status not in {"active", "inactive", "all"}:
+        raise HTTPException(status_code=400, detail="status must be active, inactive, or all")
+    query = db.query(Bus)
+    if status == "active":
+        query = query.filter(Bus.is_active == True)
+    elif status == "inactive":
+        query = query.filter(Bus.is_active == False)
+    buses = query.order_by(Bus.bus_number.asc()).all()
     return {"buses": [admin_bus_payload(bus, db) for bus in buses]}
 
 
@@ -4478,6 +4549,10 @@ def admin_update_bus(
         raise HTTPException(status_code=404, detail="Bus not found")
 
     changes = data.model_dump(exclude_unset=True)
+    if changes.get("status") == "inactive" and bus.is_active:
+        raise HTTPException(status_code=400, detail="Use the deactivate action to set a bus inactive")
+    if changes.get("status") == "active" and not bus.is_active:
+        raise HTTPException(status_code=400, detail="Use the reactivate action to restore a bus")
     if "bus_number" in changes and changes["bus_number"] != bus.bus_number:
         if db.query(Bus).filter(Bus.bus_number == changes["bus_number"]).first():
             raise HTTPException(status_code=400, detail="Bus number already exists")
@@ -4498,57 +4573,58 @@ def admin_delete_bus(bus_id: int, db: Session = Depends(get_db), current_user: d
     if not bus:
         raise HTTPException(status_code=404, detail="Bus not found")
 
-    bus_num = bus.bus_number
-    referenced = db.query(BusLocation).filter(BusLocation.bus_id == bus.id).first()
-    if referenced is None:
-        referenced = db.query(Trip).filter(Trip.bus_id == bus.id).first()
-    if referenced is None:
-        referenced = db.query(WaitRequest).filter(WaitRequest.bus_id == bus.id).first()
-    if referenced is None:
-        referenced = db.query(Notification).filter(Notification.related_bus_id == bus.id).first()
-    if referenced is None:
-        referenced = db.query(BusEntryLog).filter(BusEntryLog.bus_id == bus.id).first()
-    if referenced is None:
-        referenced = db.query(DriverComplaint).filter(DriverComplaint.bus_id == bus.id).first()
-    if referenced is None:
-        referenced = db.query(MissedBusAllotment).filter(
-            (MissedBusAllotment.original_bus_id == bus.id) |
-            (MissedBusAllotment.alternative_bus_id == bus.id)
-        ).first()
-    if referenced is None:
-        referenced = db.query(TemporaryStopChange).filter(
-            TemporaryStopChange.target_bus_id == bus.id
-        ).first()
-
     active_trip = db.query(Trip).filter(Trip.bus_id == bus.id, Trip.status == "active").first()
     if active_trip:
-        raise HTTPException(status_code=400, detail="Cannot delete a bus that is currently on an active trip")
+        raise HTTPException(status_code=409, detail="Cannot deactivate a bus that is currently on an active trip")
+    if not bus.is_active:
+        raise HTTPException(status_code=400, detail="Bus is already deactivated")
 
-    if referenced is not None:
-        db.query(Student).filter(Student.bus_id == bus.id).update({"bus_id": None})
-        bus.driver_id = None
-        bus.status = "inactive"
-        db.commit()
-        log_admin_activity(
-            db,
-            current_user["user_id"],
-            "DEACTIVATE_BUS",
-            "bus",
-            str(bus_id),
-            f"Deactivated Bus {bus_num} because it has historical references",
-        )
-        return {
-            "message": f"Bus {bus_num} has historical references and was deactivated instead of deleted",
-            "bus_id": bus_id,
-            "action": "deactivated",
-        }
-
-    # Unassign students
+    unassigned_count = db.query(Student).filter(Student.bus_id == bus.id).count()
     db.query(Student).filter(Student.bus_id == bus.id).update({"bus_id": None})
+    bus.driver_id = None
+    bus.is_active = False
+    bus.status = "inactive"
+    db.commit()
+    log_admin_activity(db, current_user["user_id"], "DEACTIVATE_BUS", "bus", str(bus_id), f"Deactivated Bus {bus.bus_number}")
+    return {
+        "message": f"Bus {bus.bus_number} deactivated",
+        "bus_id": bus_id,
+        "action": "deactivated",
+        "students_unassigned": unassigned_count,
+    }
+
+
+@app.post("/admin/buses/{bus_id}/reactivate")
+def admin_reactivate_bus(bus_id: int, db: Session = Depends(get_db), current_user: dict = Depends(require_admin)):
+    bus = db.query(Bus).filter(Bus.id == bus_id, Bus.is_active == True).first()
+    if not bus:
+        raise HTTPException(status_code=404, detail="Bus not found")
+    if bus.is_active:
+        raise HTTPException(status_code=400, detail="Bus is already active")
+    bus.is_active = True
+    bus.status = "active"
+    db.commit()
+    log_admin_activity(db, current_user["user_id"], "REACTIVATE_BUS", "bus", str(bus_id), f"Reactivated Bus {bus.bus_number}")
+    return {"message": f"Bus {bus.bus_number} reactivated", "bus_id": bus_id}
+
+
+@app.delete("/admin/buses/{bus_id}/permanent")
+def admin_permanently_delete_bus(bus_id: int, db: Session = Depends(get_db), current_user: dict = Depends(require_admin)):
+    bus = db.query(Bus).filter(Bus.id == bus_id).first()
+    if not bus:
+        raise HTTPException(status_code=404, detail="Bus not found")
+    if bus.is_active:
+        raise HTTPException(status_code=409, detail="Deactivate first before permanently deleting this bus")
+    active_trip = db.query(Trip).filter(Trip.bus_id == bus.id, Trip.status == "active").first()
+    if active_trip:
+        raise HTTPException(status_code=409, detail="Cannot permanently delete a bus with an active trip")
+    students_unassigned = db.query(Student).filter(Student.bus_id == bus.id).count()
+    db.query(Student).filter(Student.bus_id == bus.id).update({"bus_id": None})
+    bus_number = bus.bus_number
     db.delete(bus)
     db.commit()
-    log_admin_activity(db, current_user["user_id"], "DELETE_BUS", "bus", str(bus_id), f"Deleted Bus {bus_num}")
-    return {"message": f"Bus {bus_num} deleted successfully", "bus_id": bus_id, "action": "deleted"}
+    log_admin_activity(db, current_user["user_id"], "PERMANENT_DELETE_BUS", "bus", str(bus_id), f"Permanently deleted Bus {bus_number}")
+    return {"message": f"Bus {bus_number} permanently deleted", "bus_id": bus_id, "students_unassigned": students_unassigned}
 
 
 @app.post("/admin/buses/{bus_id}/assign-driver")
@@ -4612,8 +4688,19 @@ def admin_bus_assign_route(
 # ------------------------------------------------------------
 
 @app.get("/admin/drivers")
-def list_admin_drivers(db: Session = Depends(get_db), current_user: dict = Depends(require_admin)):
-    drivers = db.query(Driver).order_by(Driver.driver_code.asc()).all()
+def list_admin_drivers(
+    status: str = "active",
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    if status not in {"active", "inactive", "all"}:
+        raise HTTPException(status_code=400, detail="status must be active, inactive, or all")
+    query = db.query(Driver)
+    if status == "active":
+        query = query.filter(Driver.is_active == True)
+    elif status == "inactive":
+        query = query.filter(Driver.is_active == False)
+    drivers = query.order_by(Driver.driver_code.asc()).all()
     return {"drivers": [admin_driver_payload(d, db) for d in drivers]}
 
 
@@ -4733,39 +4820,52 @@ def admin_delete_driver(driver_id: int, db: Session = Depends(get_db), current_u
     ).first()
     if active_trip:
         raise HTTPException(
-            status_code=400,
-            detail="Cannot delete or deactivate a driver who is currently on an active trip"
+            status_code=409,
+            detail="Cannot deactivate a driver who is currently on an active trip"
         )
+    if not driver.is_active:
+        raise HTTPException(status_code=400, detail="Driver is already deactivated")
 
-    referenced = db.query(Trip).filter(Trip.driver_id == driver.id).first()
-    if referenced is None:
-        referenced = db.query(DriverComplaint).filter(DriverComplaint.driver_id == driver.id).first()
-
-    # Unassign from any bus
     db.query(Bus).filter(Bus.driver_id == driver.id).update({"driver_id": None})
-    if referenced is not None:
-        driver.is_active = False
-        db.commit()
-        log_admin_activity(
-            db,
-            current_user["user_id"],
-            "DEACTIVATE_DRIVER",
-            "driver",
-            str(driver_id),
-            f"Deactivated driver {code} because it has historical references",
-        )
-        return {
-            "message": f"Driver {code} has historical references and was deactivated instead of deleted",
-            "driver_id": driver_id,
-            "action": "deactivated",
-        }
+    driver.is_active = False
+    db.commit()
+    log_admin_activity(db, current_user["user_id"], "DEACTIVATE_DRIVER", "driver", str(driver_id), f"Deactivated driver {code}")
+    return {"message": f"Driver {code} deactivated", "driver_id": driver_id, "action": "deactivated"}
 
+
+@app.post("/admin/drivers/{driver_id}/reactivate")
+def admin_reactivate_driver(driver_id: int, db: Session = Depends(get_db), current_user: dict = Depends(require_admin)):
+    driver = db.query(Driver).filter(Driver.id == driver_id).first()
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    if driver.is_active:
+        raise HTTPException(status_code=400, detail="Driver is already active")
+    driver.is_active = True
+    db.commit()
+    log_admin_activity(db, current_user["user_id"], "REACTIVATE_DRIVER", "driver", str(driver_id), f"Reactivated driver {driver.driver_code}")
+    return {"message": f"Driver {driver.driver_code} reactivated", "driver_id": driver_id}
+
+
+@app.delete("/admin/drivers/{driver_id}/permanent")
+def admin_permanently_delete_driver(driver_id: int, db: Session = Depends(get_db), current_user: dict = Depends(require_admin)):
+    driver = db.query(Driver).filter(Driver.id == driver_id).first()
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    if driver.is_active:
+        raise HTTPException(status_code=409, detail="Deactivate first before permanently deleting this driver")
+    active_trip = db.query(Trip).filter(Trip.driver_id == driver.id, Trip.status == "active").first()
+    if active_trip:
+        raise HTTPException(status_code=409, detail="Cannot permanently delete a driver with an active trip")
+    driver_code = driver.driver_code
+    user = db.query(User).filter(User.id == driver.user_id).first()
+    db.query(Bus).filter(Bus.driver_id == driver.id).update({"driver_id": None})
     db.delete(driver)
+    db.flush()
     if user:
         db.delete(user)
     db.commit()
-    log_admin_activity(db, current_user["user_id"], "DELETE_DRIVER", "driver", str(driver_id), f"Deleted driver {code}")
-    return {"message": f"Driver {code} removed successfully", "driver_id": driver_id, "action": "deleted"}
+    log_admin_activity(db, current_user["user_id"], "PERMANENT_DELETE_DRIVER", "driver", str(driver_id), f"Permanently deleted driver {driver_code}")
+    return {"message": f"Driver {driver_code} permanently deleted", "driver_id": driver_id, "students_unassigned": 0}
 
 
 # ------------------------------------------------------------
@@ -4810,7 +4910,11 @@ def get_all_students(
     elif travelling == "false":
         results = [r for r in results if r.get("travelling_today") is False]
 
-    return {"students": results}
+    return {
+        "students": results,
+        "unassigned_bus_count": db.query(Student).filter(Student.bus_id.is_(None), Student.is_active == True).count(),
+        "unassigned_stop_count": db.query(Student).filter(Student.stop_id.is_(None), Student.is_active == True).count(),
+    }
 
 
 @app.get("/admin/students/{student_id}")
@@ -4885,12 +4989,20 @@ def admin_update_student(
     if data.department is not None:
         student.department = data.department
     if data.bus_id is not None:
-        if data.bus_id != 0 and not db.query(Bus).filter(Bus.id == data.bus_id).first():
-            raise HTTPException(status_code=404, detail="Bus not found")
+        if data.bus_id != 0:
+            assigned_bus = db.query(Bus).filter(Bus.id == data.bus_id).first()
+            if not assigned_bus:
+                raise HTTPException(status_code=404, detail="Bus not found")
+            if not assigned_bus.is_active:
+                raise HTTPException(status_code=409, detail="Cannot assign a deactivated bus")
         student.bus_id = data.bus_id if data.bus_id != 0 else None
     if data.stop_id is not None:
-        if data.stop_id != 0 and not db.query(Stop).filter(Stop.id == data.stop_id).first():
-            raise HTTPException(status_code=404, detail="Stop not found")
+        if data.stop_id != 0:
+            assigned_stop = db.query(Stop).filter(Stop.id == data.stop_id).first()
+            if not assigned_stop:
+                raise HTTPException(status_code=404, detail="Stop not found")
+            if not assigned_stop.is_active:
+                raise HTTPException(status_code=409, detail="Cannot assign a deactivated stop")
         student.stop_id = data.stop_id if data.stop_id != 0 else None
 
     notify_assignment_change(db, student, old_bus_id, old_stop_id)
@@ -4953,6 +5065,31 @@ def admin_delete_student(student_id: int, db: Session = Depends(get_db), current
     return {"message": f"Student {roll} deleted successfully", "student_id": student_id, "action": "deleted"}
 
 
+@app.post("/admin/students/{student_id}/reactivate")
+def admin_reactivate_student(
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    if student.is_active:
+        raise HTTPException(status_code=400, detail="Student is already active")
+
+    student.is_active = True
+    db.commit()
+    log_admin_activity(
+        db,
+        current_user["user_id"],
+        "REACTIVATE_STUDENT",
+        "student",
+        str(student_id),
+        f"Reactivated student {student.roll_number}",
+    )
+    return {"message": f"Student {student.roll_number} reactivated", "student_id": student_id}
+
+
 def notify_assignment_change(db, student, old_bus_id, old_stop_id):
     if not student.user_id:
         return
@@ -4980,14 +5117,18 @@ def admin_assign_student_bus(
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student profile not found")
-    if data.bus_id is not None and not db.query(Bus).filter(Bus.id == data.bus_id).first():
-        raise HTTPException(status_code=404, detail="Bus not found")
+    if data.bus_id is not None:
+        bus = db.query(Bus).filter(Bus.id == data.bus_id).first()
+        if not bus:
+            raise HTTPException(status_code=404, detail="Bus not found")
+        if not bus.is_active:
+            raise HTTPException(status_code=409, detail="Cannot assign a deactivated bus")
 
     old_bus_id, old_stop_id = student.bus_id, student.stop_id
     student.bus_id = data.bus_id
     if student.stop_id is not None and data.bus_id is not None:
-        stop = db.query(Stop).filter(Stop.id == student.stop_id).first()
-        bus = db.query(Bus).filter(Bus.id == data.bus_id).first()
+        stop = db.query(Stop).filter(Stop.id == student.stop_id, Stop.is_active == True).first()
+        bus = db.query(Bus).filter(Bus.id == data.bus_id, Bus.is_active == True).first()
         if not stop or not bus or stop.route_id != bus.route_id:
             student.stop_id = None
     notify_assignment_change(db, student, old_bus_id, old_stop_id)
@@ -5013,7 +5154,9 @@ def admin_assign_student_stop(
         stop = db.query(Stop).filter(Stop.id == data.stop_id).first()
         if not stop:
             raise HTTPException(status_code=404, detail="Stop not found")
-        bus = db.query(Bus).filter(Bus.id == student.bus_id).first() if student.bus_id else None
+        if not stop.is_active:
+            raise HTTPException(status_code=409, detail="Cannot assign a deactivated stop")
+        bus = db.query(Bus).filter(Bus.id == student.bus_id, Bus.is_active == True).first() if student.bus_id else None
         if not bus or bus.route_id != stop.route_id:
             raise HTTPException(status_code=400, detail="Stop must belong to the student's assigned bus route")
         student.stop_id = stop.id
@@ -5040,6 +5183,7 @@ def admin_stop_payload(stop: Stop, db: Session):
         "evening_latitude": stop.evening_latitude,
         "evening_longitude": stop.evening_longitude,
         "stop_order": stop.stop_order,
+        "is_active": stop.is_active,
         "student_count": student_count
     }
 
@@ -5047,12 +5191,19 @@ def admin_stop_payload(stop: Stop, db: Session):
 @app.get("/admin/stops")
 def list_admin_stops(
     route_id: int | None = None,
+    status: str = "active",
     db: Session = Depends(get_db),
     current_user: dict = Depends(require_admin)
 ):
+    if status not in {"active", "inactive", "all"}:
+        raise HTTPException(status_code=400, detail="status must be active, inactive, or all")
     query = db.query(Stop)
     if route_id is not None:
         query = query.filter(Stop.route_id == route_id)
+    if status == "active":
+        query = query.filter(Stop.is_active == True)
+    elif status == "inactive":
+        query = query.filter(Stop.is_active == False)
     stops = query.order_by(Stop.route_id.asc(), Stop.stop_order.asc()).all()
     return {"stops": [admin_stop_payload(s, db) for s in stops]}
 
@@ -5143,53 +5294,61 @@ def admin_delete_stop(stop_id: int, db: Session = Depends(get_db), current_user:
         raise HTTPException(status_code=404, detail="Stop not found")
 
     stop_name = stop.name
-    route_id = stop.route_id
-    deleted_order = stop.stop_order
-
-    blockers = []
-    stop_fk_target = f"{Stop.__tablename__}.id"
-    for mapper in Base.registry.mappers:
-        model = mapper.class_
-        stop_fk_columns = [
-            column
-            for column in model.__table__.columns
-            if any(fk.target_fullname == stop_fk_target for fk in column.foreign_keys)
-        ]
-        if not stop_fk_columns:
-            continue
-
-        condition = stop_fk_columns[0] == stop.id
-        for column in stop_fk_columns[1:]:
-            condition = condition | (column == stop.id)
-
-        reference_count = db.query(model).filter(condition).count()
-        if reference_count:
-            blockers.append(f"{model.__tablename__} ({reference_count} records)")
-
-    if blockers:
-        stop.is_active = False
-        db.commit()
-        log_admin_activity(
-            db, current_user["user_id"], "DEACTIVATE_STOP", "stop", str(stop_id),
-            f"Deactivated stop {stop_name} (referenced in: {', '.join(blockers)})"
+    active_temp_count = db.query(TemporaryStopChange).filter(
+        TemporaryStopChange.status.in_(["active", "scheduled", "pending"]),
+        (TemporaryStopChange.original_stop_id == stop.id)
+        | (TemporaryStopChange.temporary_stop_id == stop.id)
+        | (TemporaryStopChange.morning_temporary_stop_id == stop.id)
+        | (TemporaryStopChange.evening_temporary_stop_id == stop.id),
+    ).count()
+    if active_temp_count:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot deactivate stop {stop_name}: it is used by {active_temp_count} active temporary stop change(s)",
         )
-        return {
-            "message": f"Stop {stop_name} has historical references and was deactivated instead of deleted",
-            "stop_id": stop_id,
-            "action": "deactivated"
-        }
+    if not stop.is_active:
+        raise HTTPException(status_code=400, detail="Stop is already deactivated")
 
-    # Unassign students
+    unassigned_count = db.query(Student).filter(Student.stop_id == stop.id).count()
     db.query(Student).filter(Student.stop_id == stop.id).update({"stop_id": None})
-    db.delete(stop)
-
-    # Reorder remaining stops
-    db.query(Stop).filter(Stop.route_id == route_id, Stop.stop_order > deleted_order).update(
-        {Stop.stop_order: Stop.stop_order - 1}
-    )
+    stop.is_active = False
     db.commit()
-    log_admin_activity(db, current_user["user_id"], "DELETE_STOP", "stop", str(stop_id), f"Deleted stop {stop_name}")
-    return {"message": f"Stop {stop_name} deleted successfully", "stop_id": stop_id, "action": "deleted"}
+    log_admin_activity(db, current_user["user_id"], "DEACTIVATE_STOP", "stop", str(stop_id), f"Deactivated stop {stop_name}")
+    return {
+        "message": f"Stop {stop_name} deactivated",
+        "stop_id": stop_id,
+        "action": "deactivated",
+        "students_unassigned": unassigned_count,
+    }
+
+
+@app.post("/admin/stops/{stop_id}/reactivate")
+def admin_reactivate_stop(stop_id: int, db: Session = Depends(get_db), current_user: dict = Depends(require_admin)):
+    stop = db.query(Stop).filter(Stop.id == stop_id).first()
+    if not stop:
+        raise HTTPException(status_code=404, detail="Stop not found")
+    if stop.is_active:
+        raise HTTPException(status_code=400, detail="Stop is already active")
+    stop.is_active = True
+    db.commit()
+    log_admin_activity(db, current_user["user_id"], "REACTIVATE_STOP", "stop", str(stop_id), f"Reactivated stop {stop.name}")
+    return {"message": f"Stop {stop.name} reactivated", "stop_id": stop_id}
+
+
+@app.delete("/admin/stops/{stop_id}/permanent")
+def admin_permanently_delete_stop(stop_id: int, db: Session = Depends(get_db), current_user: dict = Depends(require_admin)):
+    stop = db.query(Stop).filter(Stop.id == stop_id).first()
+    if not stop:
+        raise HTTPException(status_code=404, detail="Stop not found")
+    if stop.is_active:
+        raise HTTPException(status_code=409, detail="Deactivate first before permanently deleting this stop")
+    students_unassigned = db.query(Student).filter(Student.stop_id == stop.id).count()
+    db.query(Student).filter(Student.stop_id == stop.id).update({"stop_id": None})
+    stop_name = stop.name
+    db.delete(stop)
+    db.commit()
+    log_admin_activity(db, current_user["user_id"], "PERMANENT_DELETE_STOP", "stop", str(stop_id), f"Permanently deleted stop {stop_name}")
+    return {"message": f"Stop {stop_name} permanently deleted", "stop_id": stop_id, "students_unassigned": students_unassigned}
 
 
 # ------------------------------------------------------------
@@ -5832,10 +5991,13 @@ def get_today_operations(db: Session = Depends(get_db), current_user: dict = Dep
     active_buses = []
     offline_buses = []
     not_started_buses = []
+    deactivated_buses = []
 
     for bus in buses:
         payload = admin_bus_payload(bus, db)
-        if payload["trip_status"] == "active":
+        if not bus.is_active:
+            deactivated_buses.append(payload)
+        elif payload["trip_status"] == "active":
             active_buses.append(payload)
         elif bus.status == "active":
             not_started_buses.append(payload)
@@ -5860,7 +6022,8 @@ def get_today_operations(db: Session = Depends(get_db), current_user: dict = Dep
             "total": len(buses),
             "active_now": len(active_buses),
             "not_started": len(not_started_buses),
-            "offline": len(offline_buses)
+            "offline": len(offline_buses),
+            "deactivated": len(deactivated_buses),
         },
         "students_summary": {
             "total_registered": total_students,
@@ -5873,7 +6036,8 @@ def get_today_operations(db: Session = Depends(get_db), current_user: dict = Dep
         },
         "active_buses": active_buses,
         "not_started_buses": not_started_buses,
-        "offline_buses": offline_buses
+        "offline_buses": offline_buses,
+        "deactivated_buses": deactivated_buses,
     }
 
 
@@ -6145,7 +6309,7 @@ def start_driver_trip(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    bus = db.query(Bus).filter(Bus.driver_id == driver.id).first()
+    bus = get_active_bus_for_driver(db, driver)
     if not bus:
         raise HTTPException(status_code=404, detail="No bus assigned to this driver")
 
@@ -6226,7 +6390,7 @@ def get_student_my_bus(
         raise HTTPException(status_code=404, detail="No bus assigned to this student")
 
     user = db.query(User).filter(User.id == student.user_id).first()
-    regular_bus = db.query(Bus).filter(Bus.id == student.bus_id).first()
+    regular_bus = db.query(Bus).filter(Bus.id == student.bus_id, Bus.is_active == True).first()
     current_bus_id = get_current_bus_id(student, db)
 
     # Keep existing response metadata while using the shared bus resolver.
@@ -6235,7 +6399,7 @@ def get_student_my_bus(
     alt_bus_id = current_bus_id if current_bus_id != student.bus_id else None
 
     if alt_bus_id:
-        alt_bus = db.query(Bus).filter(Bus.id == alt_bus_id).first()
+        alt_bus = db.query(Bus).filter(Bus.id == alt_bus_id, Bus.is_active == True).first()
         if alt_bus:
             alt_route = db.query(Route).filter(Route.id == alt_bus.route_id).first() if alt_bus.route_id else None
             alt_driver = db.query(Driver).filter(Driver.id == alt_bus.driver_id).first() if alt_bus.driver_id else None
@@ -6454,7 +6618,7 @@ def skip_wait_request(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    bus = db.query(Bus).filter(Bus.driver_id == driver.id).first()
+    bus = get_active_bus_for_driver(db, driver)
     if not bus:
         raise HTTPException(status_code=404, detail="No bus assigned to this driver")
 
@@ -6662,7 +6826,7 @@ def verify_student_pass(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    bus = db.query(Bus).filter(Bus.driver_id == driver.id).first()
+    bus = get_active_bus_for_driver(db, driver)
     if not bus:
         raise HTTPException(status_code=404, detail="No bus assigned to this driver")
 
@@ -6683,7 +6847,7 @@ def verify_student_pass(
 
     current_bus_id = get_current_bus_id(student, db)
     if current_bus_id != bus.id:
-        assigned_bus = db.query(Bus).filter(Bus.id == current_bus_id).first() if current_bus_id else None
+        assigned_bus = db.query(Bus).filter(Bus.id == current_bus_id, Bus.is_active == True).first() if current_bus_id else None
         bus_name = f"Bus {assigned_bus.bus_number}" if assigned_bus else "another bus"
         raise HTTPException(
             status_code=400,
@@ -6691,10 +6855,13 @@ def verify_student_pass(
         )
 
     is_travelling = student_is_travelling_today(db, student.id)
-    stop = db.query(Stop).filter(Stop.id == student.stop_id).first() if student.stop_id else None
-    stop_name = stop.name if stop else "Route Stop"
-
     active_trip = get_active_trip_for_bus(db, bus.id)
+    stop, _ = get_effective_student_stop(
+        db, student, active_trip.trip_type if active_trip else None
+    )
+    if not stop:
+        raise HTTPException(status_code=400, detail="Student has no active assigned stop")
+    stop_name = stop.name if stop else "Route Stop"
     try:
         entry_log = BusEntryLog(
             bus_id=bus.id,
@@ -6739,7 +6906,7 @@ def report_driver_detour(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    bus = db.query(Bus).filter(Bus.driver_id == driver.id).first()
+    bus = get_active_bus_for_driver(db, driver)
     if not bus:
         raise HTTPException(status_code=404, detail="No bus assigned to this driver")
 
@@ -6822,7 +6989,7 @@ def report_driver_emergency_sos(
     if not driver:
         raise HTTPException(status_code=404, detail="Driver profile not found")
 
-    bus = db.query(Bus).filter(Bus.driver_id == driver.id).first()
+    bus = get_active_bus_for_driver(db, driver)
     if not bus:
         raise HTTPException(status_code=404, detail="No bus assigned to this driver")
 

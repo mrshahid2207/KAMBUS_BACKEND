@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from database import SessionLocal
+from models import Driver, Student
 
 
 # =========================
@@ -89,7 +91,19 @@ security = HTTPBearer()
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
-    return get_user_from_token(credentials.credentials)
+    current_user = get_user_from_token(credentials.credentials)
+    if current_user["role"] not in {"driver", "student"}:
+        return current_user
+
+    db = SessionLocal()
+    try:
+        model = Driver if current_user["role"] == "driver" else Student
+        profile = db.query(model).filter(model.user_id == current_user["user_id"]).first()
+        if not profile or not profile.is_active:
+            raise HTTPException(status_code=403, detail=f"This {current_user['role']} account has been deactivated")
+    finally:
+        db.close()
+    return current_user
 
 
 def get_user_from_token(token: str):
@@ -132,13 +146,19 @@ def get_user_from_token(token: str):
 def require_driver(
     current_user: dict = Depends(get_current_user)
 ):
-
     if current_user["role"] != "driver":
-
         raise HTTPException(
             status_code=403,
             detail="Driver access required"
         )
+
+    db = SessionLocal()
+    try:
+        driver = db.query(Driver).filter(Driver.user_id == current_user["user_id"]).first()
+        if not driver or not driver.is_active:
+            raise HTTPException(status_code=403, detail="This driver account has been deactivated")
+    finally:
+        db.close()
 
     return current_user
 
@@ -179,5 +199,13 @@ def require_student(
             status_code=403,
             detail="Student access required"
         )
+
+    db = SessionLocal()
+    try:
+        student = db.query(Student).filter(Student.user_id == current_user["user_id"]).first()
+        if not student or not student.is_active:
+            raise HTTPException(status_code=403, detail="This student account has been deactivated")
+    finally:
+        db.close()
 
     return current_user
