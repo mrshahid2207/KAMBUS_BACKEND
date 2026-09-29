@@ -1116,6 +1116,140 @@ def test_temporary_stop_own_bus_candidate_ranking_and_exclusion(setup_test_envir
     assert all(c["bus_id"] != bus1.id for c in data["candidate_buses"])
 
 
+@pytest.mark.parametrize("directions", [("morning",), ("evening",), ("morning", "evening")])
+def test_independent_temporary_directions_and_admin_approval(setup_test_environment, db_session, directions):
+    env = setup_test_environment
+    env["student"].roll_number = "TEST_DIRECTION_" + "_".join(directions)
+    stop = env["stop_a2"]
+    stop.evening_latitude = stop.latitude + 0.001
+    stop.evening_longitude = stop.longitude + 0.001
+    db_session.commit()
+    body = {f"{direction}_location": {"stop_id": stop.id} for direction in directions}
+    body.update(start_date=date.today().isoformat(), end_date=date.today().isoformat())
+    response = client.post("/student/temporary-stop-change", json=body, headers=env["headers_student"])
+    assert response.status_code == 200, response.text
+    created = response.json()
+    change = db_session.get(TemporaryStopChange, created["request_id"])
+    assert created["directions"] == list(directions)
+    for direction in ("morning", "evening"):
+        expected_id = stop.id if direction in directions else None
+        assert getattr(change, f"{direction}_temporary_stop_id") == expected_id
+        assert created[f"{direction}_temporary_stop_id"] == expected_id
+        effective, _ = get_effective_student_stop(db_session, env["student"], direction)
+        assert effective.id == (stop.id if direction in directions else env["stop_a1"].id)
+        if direction not in directions:
+            for field in ("stop_id", "stop_name", "latitude", "longitude"):
+                assert created[f"{direction}_temporary_{field}"] is None
+    if "evening" in directions:
+        assert created["evening_temporary_latitude"] == stop.evening_latitude
+
+    # Exercise pending -> approved without changing the existing automatic approval policy.
+    change.status = "pending_admin_approval"
+    db_session.commit()
+    logs = client.get("/admin/temporary-stop-requests", headers=env["headers_admin"]).json()
+    log = next(item for item in logs if item["request_id"] == change.id)
+    assert log["directions"] == list(directions)
+    approved = client.post(f"/admin/temporary-stop-requests/{change.id}/approve", json={}, headers=env["headers_admin"])
+    assert approved.status_code == 200
+    for endpoint in ("/student/temporary-stop-change", "/student/my-route-stops", "/student/all-bus-routes"):
+        result = client.get(endpoint, headers=env["headers_student"])
+        assert result.status_code == 200, result.text
+        selection = result.json() if endpoint.endswith("temporary-stop-change") else result.json()["temporary_stop"]
+        assert selection["directions"] == list(directions)
+        for direction in set(("morning", "evening")) - set(directions):
+            assert selection[f"{direction}_temporary_stop_id"] is None
+            assert selection[f"{direction}_temporary_latitude"] is None
+
+    # Replay the actual startup backfill SQL; intentionally absent directions survive.
+    import ast
+    import pathlib
+    import main
+    from sqlalchemy import text
+    tree = ast.parse(pathlib.Path(main.__file__).read_text(encoding="utf-8"))
+    statement = next(node.value for node in ast.walk(tree) if isinstance(node, ast.Constant)
+                     and isinstance(node.value, str) and "SET morning_temporary_stop_id" in node.value)
+    db_session.execute(text(statement))
+    db_session.commit()
+    db_session.refresh(change)
+    for direction in ("morning", "evening"):
+        assert getattr(change, f"{direction}_temporary_stop_id") == (stop.id if direction in directions else None)
+
+
+@pytest.mark.parametrize("directions", [("morning",), ("evening",), ("morning", "evening")])
+def test_independent_direction_pins_use_the_matching_road_geometry(setup_test_environment, monkeypatch, directions):
+    env = setup_test_environment
+    requested_directions = []
+    locations = {
+        "morning": {"latitude": 17.98, "longitude": 79.535, "address": "TEST Morning pin"},
+        "evening": {"latitude": 17.99, "longitude": 79.535, "address": "TEST Evening pin"},
+    }
+
+    def geometry(db, route_id, trip_type=None):
+        requested_directions.append(trip_type)
+        if route_id != env["bus1"].route_id:
+            return []
+        latitude = 17.99 if trip_type == "evening" else 17.98
+        return [(latitude, 79.53), (latitude, 79.54)]
+
+    monkeypatch.setattr("main.get_route_polyline_points", geometry)
+    for direction in directions:
+        checked = client.post("/student/temporary-stop-change/check-route", headers=env["headers_student"],
+                              json={**locations[direction], "trip_type": direction})
+        assert checked.status_code == 200
+        assert checked.json()["on_route"] is True
+        assert requested_directions[-1] == direction
+    submitted = client.post("/student/temporary-stop-change", headers=env["headers_student"], json={
+        **{f"{direction}_location": locations[direction] for direction in directions},
+        "start_date": date.today().isoformat(), "end_date": date.today().isoformat(),
+    })
+    assert submitted.status_code == 200, submitted.text
+    result = submitted.json()
+    assert result["directions"] == list(directions)
+    for direction in directions:
+        assert result[f"{direction}_temporary_latitude"] == locations[direction]["latitude"]
+        assert result[f"{direction}_temporary_longitude"] == locations[direction]["longitude"]
+
+
+@pytest.mark.parametrize("locations", [{}, {"morning_location": None, "evening_location": None}, {"morning_location": {}}, {"evening_location": {"latitude": 18}}])
+def test_temporary_directions_reject_empty_or_incomplete_input(setup_test_environment, locations):
+    response = client.post("/student/temporary-stop-change", headers=setup_test_environment["headers_student"],
+                           json={**locations, "start_date": date.today().isoformat(), "end_date": date.today().isoformat()})
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize("trip_type", ["morning", "evening"])
+def test_route_explorer_exposes_both_direction_coordinates(setup_test_environment, db_session, monkeypatch, trip_type):
+    from types import SimpleNamespace
+
+    env = setup_test_environment
+    stop = env["stop_a1"]
+    stop.evening_latitude = stop.latitude + 0.001
+    stop.evening_longitude = stop.longitude + 0.001
+    db_session.commit()
+    monkeypatch.setattr("main.get_active_trip_for_bus", lambda *args: SimpleNamespace(trip_type=trip_type))
+
+    response = client.get("/student/my-route-stops", headers=env["headers_student"])
+    assert response.status_code == 200
+    own_stop = next(item for item in response.json()["stops"] if item["stop_id"] == stop.id)
+    assert own_stop["morning_latitude"] == stop.latitude
+    assert own_stop["morning_longitude"] == stop.longitude
+    assert own_stop["evening_latitude"] == stop.evening_latitude
+    assert own_stop["evening_longitude"] == stop.evening_longitude
+    assert own_stop["latitude"] == (stop.evening_latitude if trip_type == "evening" else stop.latitude)
+
+    response = client.get("/student/all-bus-routes", headers=env["headers_student"])
+    assert response.status_code == 200
+    bus = next(item for item in response.json()["buses"] if item["bus_id"] == env["bus1"].id)
+    fleet_stop = next(item for item in bus["stops"] if item["stop_id"] == stop.id)
+    assert fleet_stop["latitude"] == stop.latitude
+    assert fleet_stop["longitude"] == stop.longitude
+    assert fleet_stop["evening_latitude"] == stop.evening_latitude
+    assert fleet_stop["evening_longitude"] == stop.evening_longitude
+    fallback_stop = next(item for item in bus["stops"] if item["stop_id"] == env["stop_a2"].id)
+    assert fallback_stop["evening_latitude"] is None
+    assert fallback_stop["evening_longitude"] is None
+
+
 def test_student_all_bus_routes_reference_endpoint(setup_test_environment):
     """
     FEATURE VERIFICATION:

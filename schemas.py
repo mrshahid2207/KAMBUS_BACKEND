@@ -255,7 +255,8 @@ class TemporaryStopChangeCreate(BaseModel):
     address: str | None = Field(None, max_length=255)
 
     # Directional input. The original flat fields above remain supported for
-    # existing clients; a single supplied direction is mirrored to the other.
+    # existing clients. Each direction is optional; at least one is required
+    # by the endpoint. An omitted direction is never copied from the other.
     morning_location: TemporaryStopLocation | None = None
     evening_location: TemporaryStopLocation | None = None
 
@@ -268,6 +269,7 @@ class TemporaryStopChangeCreate(BaseModel):
 
 class TemporaryStopCheckRequest(BaseModel):
     """Pre-flight check before scheduling — does not persist anything."""
+    trip_type: str | None = Field(None, pattern="^(morning|evening)$")
     stop_id: int | None = None
     latitude: float | None = Field(None, ge=-90, le=90, validation_alias=AliasChoices("latitude", "lat"))
     longitude: float | None = Field(None, ge=-180, le=180, validation_alias=AliasChoices("longitude", "lng"))
