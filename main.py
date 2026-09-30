@@ -2655,6 +2655,11 @@ def get_active_temporary_stop_change(db: Session, student_id: int, on_date: date
 
 def get_effective_student_stop(db: Session, student: Student, trip_type: str | None = None):
     """Return the effective stop, selecting a directional temporary stop when known."""
+    allotment = get_active_missed_bus_allotment(db, student.id)
+    if allotment:
+        pickup = db.query(Stop).filter(Stop.id == allotment.stop_id, Stop.is_active == True).first()
+        if pickup:
+            return pickup, None
     expire_temporary_stop_changes(db, student.id)
     temp_change = get_active_temporary_stop_change(db, student.id)
     if temp_change:
@@ -2978,7 +2983,7 @@ def automatically_allot_alternative_bus(
     db.commit()
     db.refresh(allotment)
 
-    send_notification(
+    student_notification = send_notification(
         db,
         student.user_id,
         "Alternative Bus Allotted",
@@ -2995,7 +3000,29 @@ def automatically_allot_alternative_bus(
         related_bus_id=alternative_bus.id,
         related_trip_id=alternative_trip.id if alternative_trip else None,
     )
+    driver_notifications = []
+    for affected_bus in (original_bus, alternative_bus):
+        driver = db.query(Driver).filter(Driver.id == affected_bus.driver_id).first() if affected_bus.driver_id else None
+        if not driver:
+            continue
+        receiving = affected_bus.id == alternative_bus.id
+        message = (f"New pickup allotted to {alternative_bus.bus_number}: {stop.name}."
+                   if receiving else f"Passenger reassigned to {alternative_bus.bus_number} from {stop.name}.")
+        payload = {"bus_id": affected_bus.id, "stop_id": stop.id, "allotment_id": allotment.id}
+        notice = send_notification(db, driver.user_id, "Bus allotment updated", message,
+                                   "bus_roster_changed", payload, related_bus_id=affected_bus.id)
+        driver_notifications.append((driver.user_id, notice, payload))
     db.commit()
+    notification_manager.push_notification_sync(student.user_id, {
+        "id": student_notification.id, "type": "alternative_bus_allotted",
+        "title": student_notification.title, "message": student_notification.message,
+        "alternative_bus_id": alternative_bus.id,
+    })
+    for driver_user_id, notice, payload in driver_notifications:
+        notification_manager.push_notification_sync(driver_user_id, {
+            **payload, "id": notice.id, "type": "bus_roster_changed",
+            "title": notice.title, "message": notice.message,
+        })
 
     return {
         "success": True,

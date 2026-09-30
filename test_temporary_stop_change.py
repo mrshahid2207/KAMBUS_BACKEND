@@ -820,6 +820,55 @@ def test_missed_bus_rejects_candidate_without_active_trip(setup_test_environment
     assert db_session.query(MissedBusAllotment).filter(MissedBusAllotment.student_id == env["student"].id).count() == 0
 
 
+def test_missed_bus_refresh_events_and_driver_pickup(setup_test_environment, db_session, monkeypatch):
+    import main
+    env = setup_test_environment
+    _mock_missed_bus_routes(monkeypatch, env)
+    _, alternative_trip = _create_missed_bus_trips(db_session, env)
+    user = User(name="TEST Receiving Driver", email="test_receiver@kambus.test", phone="9999900099",
+                password_hash=env["user_driver"].password_hash, role="driver", is_verified=True)
+    db_session.add(user)
+    db_session.flush()
+    driver = Driver(user_id=user.id, driver_code="TEST_RECEIVER", license_number="TEST_RECEIVER_LICENSE")
+    db_session.add(driver)
+    db_session.flush()
+    env["bus2"].driver_id = driver.id
+    alternative_trip.driver_id = driver.id
+    db_session.commit()
+    events = []
+    monkeypatch.setattr(main.notification_manager, "push_notification_sync", lambda user_id, message: events.append((user_id, message)))
+    try:
+        response = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+        assert response.status_code == 200, response.text
+        assert (env["user_student"].id, "alternative_bus_allotted") in [(uid, event["type"]) for uid, event in events]
+        driver_events = [(uid, event) for uid, event in events if event["type"] == "bus_roster_changed"]
+        assert {uid for uid, _ in driver_events} == {env["user_driver"].id, user.id}
+        assert next(event for uid, event in driver_events if uid == user.id)["bus_id"] == env["bus2"].id
+        # A later regular-stop edit must not erase the pickup stored with this allotment.
+        env["student"].stop_id = env["stop_a2"].id
+        db_session.commit()
+        pickup = client.get("/student/my-stop", headers=env["headers_student"]).json()
+        assert pickup["stop_id"] == env["stop_a1"].id
+        assert pickup["bus_id"] == env["bus2"].id
+        headers = {"Authorization": f"Bearer {create_access_token(user.id, 'driver')}"}
+        route = client.get("/driver/route-stops", headers=headers)
+        assert route.status_code == 200, route.text
+        assert route.json()["bus_id"] == env["bus2"].id
+        received_stop = next(stop for stop in route.json()["stops"] if stop["stop_id"] == env["stop_a1"].id)
+        assert received_stop["student_count"] == 1
+        before = len(events)
+        client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+        assert len(events) == before
+    finally:
+        env["bus2"].driver_id = None
+        alternative_trip.driver_id = env["driver"].id
+        db_session.query(Notification).filter(Notification.user_id == user.id).delete()
+        db_session.commit()
+        db_session.delete(driver)
+        db_session.delete(user)
+        db_session.commit()
+
+
 def test_missed_bus_repeat_post_reuses_allotment_and_notification(setup_test_environment, db_session, monkeypatch):
     env = setup_test_environment
     _mock_missed_bus_routes(monkeypatch, env)
