@@ -2506,6 +2506,11 @@ def find_candidate_buses_for_location(
         if not bus.route_id:
             continue
 
+        active_trip = get_active_trip_for_bus(db, bus.id)
+        if require_active_trip and not active_trip:
+            continue
+        match_trip_type = trip_type or (active_trip.trip_type if require_active_trip else None)
+
         route = db.query(Route).filter(Route.id == bus.route_id).first()
         if not route:
             continue
@@ -2520,7 +2525,7 @@ def find_candidate_buses_for_location(
                     is_match = True
                     match_dist = 0.0
                 else:
-                    polyline = get_route_polyline_points(db, bus.route_id, trip_type) if trip_type else get_route_polyline_points(db, bus.route_id)
+                    polyline = get_route_polyline_points(db, bus.route_id, match_trip_type) if match_trip_type else get_route_polyline_points(db, bus.route_id)
                     dist_m = min_distance_to_route_m(st.latitude, st.longitude, polyline)
                     if round(dist_m, 2) <= ROUTE_MATCH_TOLERANCE_M:
                         is_match = True
@@ -2528,7 +2533,7 @@ def find_candidate_buses_for_location(
                         if dist_m < global_min_dist:
                             global_min_dist = dist_m
         elif lat is not None and lng is not None:
-            polyline = get_route_polyline_points(db, bus.route_id, trip_type) if trip_type else get_route_polyline_points(db, bus.route_id)
+            polyline = get_route_polyline_points(db, bus.route_id, match_trip_type) if match_trip_type else get_route_polyline_points(db, bus.route_id)
             dist_m = min_distance_to_route_m(lat, lng, polyline)
             if round(dist_m, 2) <= ROUTE_MATCH_TOLERANCE_M:
                 is_match = True
@@ -2537,10 +2542,6 @@ def find_candidate_buses_for_location(
                     global_min_dist = dist_m
 
         if is_match:
-            active_trip = get_active_trip_for_bus(db, bus.id)
-            if require_active_trip and not active_trip:
-                continue
-
             driver_name = None
             driver_phone = None
             if bus.driver_id:
@@ -2813,6 +2814,51 @@ def bus_has_capacity(db: Session, bus: Bus) -> bool:
     return (registered + allotted) < capacity
 
 
+def replacement_bus_has_passed_stop(db: Session, trip: Trip, stop: Stop) -> bool:
+    """Compare positions along the candidate's road, not unrelated stop orders."""
+    import math
+
+    location = get_latest_location(db, trip.bus_id, trip.id)
+    points = (get_route_polyline_points(db, trip.route_id, trip.trip_type)
+              if trip.trip_type else get_route_polyline_points(db, trip.route_id))
+    if not location or len(points) < 2:
+        return has_passed_stop(db, trip, stop)
+
+    def project(lat, lng):
+        best_distance, best_progress, travelled = float("inf"), 0.0, 0.0
+        for a, b in zip(points, points[1:]):
+            scale = math.cos(math.radians((a[0] + b[0]) / 2))
+            dx, dy = (b[1] - a[1]) * scale, b[0] - a[0]
+            px, py = (lng - a[1]) * scale, lat - a[0]
+            length_sq = dx * dx + dy * dy
+            fraction = max(0.0, min(1.0, (px * dx + py * dy) / length_sq)) if length_sq else 0.0
+            distance = math.hypot(px - fraction * dx, py - fraction * dy) * 111320
+            length = haversine_km(a[0], a[1], b[0], b[1]) * 1000
+            if distance < best_distance:
+                best_distance, best_progress = distance, travelled + fraction * length
+            travelled += length
+        return best_distance, best_progress
+
+    bus_distance, bus_progress = project(location.latitude, location.longitude)
+    stop_distance, stop_progress = project(stop.latitude, stop.longitude)
+    # Retain the existing check when GPS or unavailable road geometry cannot
+    # support a reliable projection. Never project a distant point onto a road.
+    if max(bus_distance, stop_distance) > ROUTE_MATCH_TOLERANCE_M:
+        return has_passed_stop(db, trip, stop)
+
+    if not trip.trip_type:
+        route_stops = db.query(Stop).filter(
+            Stop.route_id == trip.route_id, Stop.is_active == True, Stop.is_custom == False
+        ).all()
+        if route_stops:
+            nearest = min(route_stops, key=lambda s: haversine_km(
+                location.latitude, location.longitude, s.latitude, s.longitude))
+            if trip_runs_in_reverse(db, trip, route_stops, nearest.stop_order):
+                return stop_progress - bus_progress > ROUTE_MATCH_TOLERANCE_M
+    # Explicit evening geometry is already ordered in the travel direction.
+    return bus_progress - stop_progress > ROUTE_MATCH_TOLERANCE_M
+
+
 def choose_alternative_bus_for_student(
     db: Session,
     student: Student,
@@ -2845,7 +2891,7 @@ def choose_alternative_bus_for_student(
         # No GPS yet: we cannot prove the bus hasn't passed the stop, so skip it.
         if get_latest_location(db, bus.id, trip.id) is None:
             continue
-        if has_passed_stop(db, trip, stop):
+        if replacement_bus_has_passed_stop(db, trip, stop):
             continue
         if not bus_has_capacity(db, bus):
             continue

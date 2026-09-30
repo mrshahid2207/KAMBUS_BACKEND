@@ -1689,6 +1689,51 @@ def _start_trip_with_gps(db, env, bus, lat=None, lng=None, speed=20, prior=None)
     return trip
 
 
+@pytest.mark.parametrize("passed", [False, True])
+def test_missed_bus_uses_candidate_evening_geometry(setup_test_environment, db_session, monkeypatch, passed):
+    env = setup_test_environment
+    _, candidate_trip = _create_missed_bus_trips(db_session, env)
+    candidate_trip.trip_type = "evening"
+    db_session.add(BusLocation(bus_id=env["bus2"].id, trip_id=candidate_trip.id,
+                               latitude=17.98, longitude=79.525 if passed else 79.54, speed=20))
+    db_session.commit()
+    calls = []
+
+    def geometry(db, route_id, trip_type=None):
+        calls.append((route_id, trip_type))
+        if route_id == env["bus2"].route_id and trip_type == "evening":
+            return [(17.98, 79.55), (17.98, 79.52)]
+        return [(17.95, 79.50), (17.95, 79.51)]
+
+    monkeypatch.setattr("main.get_route_polyline_points", geometry)
+    response = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert response.status_code == (400 if passed else 200), response.text
+    if not passed:
+        assert response.json()["alternative_bus_id"] == env["bus2"].id
+    assert (env["bus2"].route_id, "evening") in calls
+
+
+@pytest.mark.parametrize("passed", [False, True])
+def test_replacement_progress_uses_road_position_not_nearest_stop_order(setup_test_environment, db_session, monkeypatch, passed):
+    env = setup_test_environment
+    _, candidate_trip = _create_missed_bus_trips(db_session, env)
+    candidate_trip.trip_type = "morning"
+    # A road bends back near its first stop before reaching the last stop.
+    # Before the pickup, GPS is nearest the *last* registered stop.
+    env["stop_b1"].latitude, env["stop_b1"].longitude = 17.98, 79.529
+    env["stop_b2"].latitude, env["stop_b2"].longitude = 17.98, 79.54
+    lat, lng = (17.98, 79.536) if passed else (17.99, 79.54)
+    db_session.add(BusLocation(bus_id=env["bus2"].id, trip_id=candidate_trip.id,
+                               latitude=lat, longitude=lng, speed=20))
+    db_session.commit()
+    line = [(17.98, 79.529), (17.99, 79.54), (17.98, 79.53), (17.98, 79.54)]
+    monkeypatch.setattr("main.get_route_polyline_points", lambda db, route_id, trip_type=None: line)
+    response = client.post("/student/missed-bus/allot", json={}, headers=env["headers_student"])
+    assert response.status_code == (400 if passed else 200), response.text
+    if not passed:
+        assert response.json()["alternative_bus_id"] == env["bus2"].id
+
+
 def test_missed_bus_skips_replacement_bus_that_already_passed_stop(setup_test_environment, db_session, monkeypatch):
     env = setup_test_environment
     _mock_three_route_polylines(monkeypatch, env)
