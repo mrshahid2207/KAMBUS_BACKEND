@@ -20,7 +20,6 @@ from fastapi.responses import JSONResponse
 
 from database import Base, engine, SessionLocal
 from models import (
-    Campus,
     User,
     Student,
     Driver,
@@ -92,7 +91,6 @@ from schemas import (
     MissedBusAllotmentRequest,
     StartTripRequest,
 )
-from login_identity import issue_login_id
 from email_service import generate_otp_code, send_student_verification_email
 from notification_service import send_notification
 from auth import (
@@ -100,7 +98,6 @@ from auth import (
     verify_password,
     create_access_token,
     get_current_user,
-    get_current_campus,
     get_user_from_token,
     require_driver,
     require_admin,
@@ -287,15 +284,6 @@ def initialize_trip_database():
         Stop,
         Bus,
     )
-
-    # Seed fresh create_all/test databases; never overwrite existing campuses.
-    with engine.begin() as connection:
-        if connection.execute(Campus.__table__.select().limit(1)).first() is None:
-            connection.execute(Campus.__table__.insert().values(
-                id=1, name="KITSW", slug="kitsw", plan_tier="premium"
-            ))
-            if connection.dialect.name == "postgresql":
-                connection.execute(text("SELECT setval(pg_get_serial_sequence('campuses', 'id'), 1, true)"))
 
     # 1. Ensure all core tables exist
     Trip.__table__.create(bind=engine, checkfirst=True)
@@ -1028,55 +1016,43 @@ def _record_login_failure(key: str) -> None:
     _FAILED_LOGINS.setdefault(key, []).append(_monotonic())
 
 
-@app.get("/campus/me")
-def get_my_campus(campus: Campus | None = Depends(get_current_campus)):
-    if campus is None:
-        return None
-    return {"name": campus.name, "logo_url": campus.logo_url, "plan_tier": campus.plan_tier}
-
-
 @app.post("/auth/login", response_model=LoginResponse)
 def login(data: LoginRequest, db: Session = Depends(get_db)):
     login_key = _login_key(data.role, data.identifier)
     _check_login_not_locked(login_key)
-    if data.role not in ("student", "driver", "admin", "super_admin"):
-        raise HTTPException(status_code=400, detail="Invalid role")
-    login_roles = ("admin", "super_admin") if data.role in ("admin", "super_admin") else (data.role,)
-    user = db.query(User).filter(
-        User.login_id == data.identifier.strip().lower(), User.role.in_(login_roles)
-    ).first()
-    if user is None:
-        if data.role == "student":
-            student = db.query(Student).filter(Student.roll_number == data.identifier, Student.campus_id == 1).first()
-            if student:
-                user = db.query(User).filter(User.id == student.user_id).first()
+    user = None
 
-        elif data.role == "driver":
-            driver = db.query(Driver).filter(Driver.driver_code == data.identifier, Driver.campus_id == 1).first()
-            if driver:
-                user = db.query(User).filter(User.id == driver.user_id).first()
+    if data.role == "student":
+        student = db.query(Student).filter(Student.roll_number == data.identifier).first()
+        if student:
+            user = db.query(User).filter(User.id == student.user_id).first()
 
-        elif data.role in ("admin", "super_admin"):
-            # Admins sign in with their name (case-insensitive). The numeric ID still
-            # works, and is the fallback when a name is shared by more than one account.
-            identifier = data.identifier.strip()
-            named = (
-                db.query(User)
-                .filter(User.role.in_(["admin", "super_admin"]), ((User.campus_id == 1) | User.campus_id.is_(None)), func.lower(User.name) == identifier.lower())
-                .all()
-            )
-            if len(named) == 1:
-                user = named[0]
-            else:
-                try:
-                    admin_id = int(identifier)
-                except ValueError:
-                    admin_id = None
-                if admin_id is not None:
-                    user = db.query(User).filter(User.id == admin_id, User.role.in_(["admin", "super_admin"]), ((User.campus_id == 1) | User.campus_id.is_(None))).first()
+    elif data.role == "driver":
+        driver = db.query(Driver).filter(Driver.driver_code == data.identifier).first()
+        if driver:
+            user = db.query(User).filter(User.id == driver.user_id).first()
 
+    elif data.role in ("admin", "super_admin"):
+        # Admins sign in with their name (case-insensitive). The numeric ID still
+        # works, and is the fallback when a name is shared by more than one account.
+        identifier = data.identifier.strip()
+        named = (
+            db.query(User)
+            .filter(User.role.in_(["admin", "super_admin"]), func.lower(User.name) == identifier.lower())
+            .all()
+        )
+        if len(named) == 1:
+            user = named[0]
         else:
-            raise HTTPException(status_code=400, detail="Invalid role")
+            try:
+                admin_id = int(identifier)
+            except ValueError:
+                admin_id = None
+            if admin_id is not None:
+                user = db.query(User).filter(User.id == admin_id, User.role.in_(["admin", "super_admin"])).first()
+
+    else:
+        raise HTTPException(status_code=400, detail="Invalid role")
 
     bad_login_detail = (
         "Invalid username or password" if data.role in ("admin", "super_admin") else "Invalid ID or password"
@@ -1107,7 +1083,7 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
             detail="Your email is not verified yet. Please verify your email with the OTP verification code."
         )
 
-    token = create_access_token(user.id, user.role, campus_id=user.campus_id)
+    token = create_access_token(user.id, user.role)
 
     return {
         "access_token": token,
@@ -1174,7 +1150,6 @@ def student_signup(data: StudentSignupRequest, db: Session = Depends(get_db)):
 
     # Create unverified user and student
     user = User(
-        campus_id=1,
         name=name,
         email=email,
         phone=phone,
@@ -1182,7 +1157,6 @@ def student_signup(data: StudentSignupRequest, db: Session = Depends(get_db)):
         role="student",
         is_verified=0
     )
-    issue_login_id(db, user, roll_number)
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -1291,7 +1265,7 @@ def verify_student_otp(data: StudentVerifyOtpRequest, db: Session = Depends(get_
 
     student = db.query(Student).filter(Student.user_id == user.id).first()
 
-    token = create_access_token(user.id, "student", campus_id=user.campus_id)
+    token = create_access_token(user.id, "student")
 
     return {
         "success": True,
@@ -1671,13 +1645,11 @@ def create_student(data: StudentCreate, db: Session = Depends(get_db), current_a
             raise HTTPException(status_code=400, detail="Assigned stop must belong to the student's bus route")
 
     user = User(
-        campus_id=1,
         name=data.name,
         phone=data.phone,
         password_hash=hash_password(data.password),
         role="student"
     )
-    issue_login_id(db, user, data.roll_number)
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -1950,13 +1922,11 @@ def create_driver(data: DriverCreate, db: Session = Depends(get_db), current_adm
         raise HTTPException(status_code=400, detail="Driver ID already registered")
 
     user = User(
-        campus_id=1,
         name=data.name,
         phone=data.phone,
         password_hash=hash_password(data.password),
         role="driver"
     )
-    issue_login_id(db, user, data.driver_code)
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -4897,8 +4867,7 @@ def admin_create_driver(
     if db.query(Driver).filter(Driver.driver_code == data.driver_code).first():
         raise HTTPException(status_code=400, detail="Driver code already exists")
 
-    user = User(campus_id=1, name=data.name, phone=data.phone, password_hash=hash_password(data.password), role="driver")
-    issue_login_id(db, user, data.driver_code)
+    user = User(name=data.name, phone=data.phone, password_hash=hash_password(data.password), role="driver")
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -5084,8 +5053,7 @@ def admin_create_student(
     if data.stop_id and not db.query(Stop).filter(Stop.id == data.stop_id).first():
         raise HTTPException(status_code=404, detail="Stop not found")
 
-    user = User(campus_id=1, name=data.name, phone=data.phone, password_hash=hash_password(data.password), role="student")
-    issue_login_id(db, user, data.roll_number)
+    user = User(name=data.name, phone=data.phone, password_hash=hash_password(data.password), role="student")
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -6332,8 +6300,7 @@ def create_admin(
     if name_taken:
         raise HTTPException(status_code=400, detail="An admin with this name already exists")
 
-    admin = User(campus_id=1, name=name, phone=phone, password_hash=hash_password(data.password), role="admin")
-    issue_login_id(db, admin)
+    admin = User(name=name, phone=phone, password_hash=hash_password(data.password), role="admin")
     db.add(admin)
     db.commit()
     db.refresh(admin)
