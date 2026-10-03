@@ -2753,6 +2753,11 @@ def get_active_missed_bus_allotment(db: Session, student_id: int):
         if allotment.alternative_trip_id
         else None
     )
+    stop = db.query(Stop).filter(Stop.id == allotment.stop_id, Stop.is_active == True).first()
+    if trip and trip.status == "active" and stop and replacement_bus_has_passed_stop(db, trip, stop):
+        allotment.status = "completed"
+        db.commit()
+        return None
     if trip and trip.status == "active" and (
         allotment.expires_at is None or allotment.expires_at > datetime.utcnow()
     ):
@@ -6602,6 +6607,7 @@ def get_student_my_bus(
                 "is_active": alt_active_trip is not None,
                 "alternative_bus": True,
                 "allotment_id": active_allotment.id if active_allotment else None,
+                "stop_passed": False,
                 "temporary_change_id": active_temp_change.id if active_temp_change else None,
                 "original_bus_id": student.bus_id,
                 "original_bus_number": regular_bus.bus_number if regular_bus else None,
@@ -6628,6 +6634,10 @@ def get_student_my_bus(
         .filter(Trip.bus_id == regular_bus.id, Trip.status == "active")
         .order_by(Trip.started_at.desc())
         .first()
+    )
+
+    effective_stop, _ = get_effective_student_stop(
+        db, student, active_trip.trip_type if active_trip else None
     )
 
     location = None
@@ -6661,6 +6671,7 @@ def get_student_my_bus(
         "trip_status": "active" if active_trip else "inactive",
         "is_active": active_trip is not None,
         "alternative_bus": False,
+        "stop_passed": bool(active_trip and effective_stop and has_passed_stop(db, active_trip, effective_stop)),
         "location": (
             {
                 "latitude": location.latitude,

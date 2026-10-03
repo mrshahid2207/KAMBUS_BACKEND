@@ -48,7 +48,6 @@ def fleet():
             phone=f"900000{user_id:04}",
             password_hash="unused",
             role=role,
-            campus_id=1,
         )
 
     db.add_all([
@@ -59,24 +58,24 @@ def fleet():
         user(12, "driver", "Driver Two"),
     ])
     db.add_all([
-        Route(id=1, name="Original Route", campus_id=1),
-        Route(id=2, name="Replacement Route", campus_id=1),
-        Driver(id=1, user_id=11, driver_code="MAP_D1", campus_id=1),
-        Driver(id=2, user_id=12, driver_code="MAP_D2", campus_id=1),
-        Bus(id=1, bus_number="MAP_1", route_id=1, driver_id=1, status="active", campus_id=1),
-        Bus(id=2, bus_number="MAP_2", route_id=2, driver_id=2, status="active", campus_id=1),
+        Route(id=1, name="Original Route"),
+        Route(id=2, name="Replacement Route"),
+        Driver(id=1, user_id=11, driver_code="MAP_D1"),
+        Driver(id=2, user_id=12, driver_code="MAP_D2"),
+        Bus(id=1, bus_number="MAP_1", route_id=1, driver_id=1, status="active"),
+        Bus(id=2, bus_number="MAP_2", route_id=2, driver_id=2, status="active"),
     ])
     db.add_all([
-        Stop(id=1, route_id=1, name="Original One", latitude=17.98, longitude=79.52, stop_order=1, campus_id=1),
-        Stop(id=2, route_id=1, name="Original Pickup", latitude=17.98, longitude=79.53, stop_order=2, campus_id=1),
-        Stop(id=3, route_id=1, name="Original Three", latitude=17.98, longitude=79.54, stop_order=3, campus_id=1),
-        Stop(id=21, route_id=2, name="Replacement One", latitude=18.00, longitude=79.50, stop_order=1, campus_id=1),
-        Stop(id=22, route_id=2, name="Replacement Two", latitude=18.01, longitude=79.51, stop_order=2, campus_id=1),
+        Stop(id=1, route_id=1, name="Original One", latitude=17.98, longitude=79.52, stop_order=1),
+        Stop(id=2, route_id=1, name="Original Pickup", latitude=17.98, longitude=79.53, stop_order=2),
+        Stop(id=3, route_id=1, name="Original Three", latitude=17.98, longitude=79.54, stop_order=3),
+        Stop(id=21, route_id=2, name="Replacement One", latitude=18.00, longitude=79.50, stop_order=1),
+        Stop(id=22, route_id=2, name="Replacement Two", latitude=18.01, longitude=79.51, stop_order=2),
     ])
     db.add_all([
-        Student(id=1, user_id=1, roll_number="MAP1", bus_id=1, stop_id=2, campus_id=1),
-        Student(id=2, user_id=2, roll_number="MAP2", bus_id=1, stop_id=3, campus_id=1),
-        Student(id=3, user_id=3, roll_number="MAP3", bus_id=2, stop_id=21, campus_id=1),
+        Student(id=1, user_id=1, roll_number="MAP1", bus_id=1, stop_id=2),
+        Student(id=2, user_id=2, roll_number="MAP2", bus_id=1, stop_id=3),
+        Student(id=3, user_id=3, roll_number="MAP3", bus_id=2, stop_id=21),
     ])
     db.commit()
 
@@ -125,7 +124,6 @@ def test_missed_bus_pickup_appears_and_is_affected(fleet):
         stop_id=2,
         status="active",
         expires_at=None,
-        campus_id=1,
     ))
     fleet.db.commit()
 
@@ -138,9 +136,9 @@ def test_missed_bus_pickup_appears_and_is_affected(fleet):
 def test_morning_and_evening_temporary_stops_are_separate(fleet):
     fleet.db.add_all([
         Stop(id=90, route_id=2, name="Morning Temporary", latitude=18.02, longitude=79.52,
-             stop_order=3, is_custom=True, campus_id=1),
+             stop_order=3, is_custom=True),
         Stop(id=91, route_id=2, name="Evening Temporary", latitude=18.03, longitude=79.53,
-             stop_order=4, is_custom=True, campus_id=1),
+             stop_order=4, is_custom=True),
         TemporaryStopChange(
             student_id=1,
             original_stop_id=2,
@@ -151,7 +149,6 @@ def test_morning_and_evening_temporary_stops_are_separate(fleet):
             start_date=date.today(),
             end_date=date.today(),
             status="active",
-            campus_id=1,
         ),
     ])
     fleet.db.commit()
@@ -171,7 +168,6 @@ def test_replacement_stop_is_flagged_once(fleet):
         alternative_trip_id=trip.id,
         stop_id=21,
         status="active",
-        campus_id=1,
     ))
     fleet.db.commit()
 
@@ -186,8 +182,8 @@ def test_not_travelling_students_are_excluded(fleet):
     fleet.db.add_all([
         Trip(bus_id=2, driver_id=2, route_id=2, status="active", trip_type="morning"),
         MissedBusAllotment(student_id=1, alternative_bus_id=2, alternative_trip_id=1,
-                           stop_id=2, status="active", campus_id=1),
-        TravelStatus(student_id=1, date=date.today(), status="not_travelling", campus_id=1),
+                           stop_id=2, status="active"),
+        TravelStatus(student_id=1, date=date.today(), status="not_travelling"),
     ])
     fleet.db.commit()
     # Point the allotment at the actual active trip after its insert-generated id exists.
@@ -223,7 +219,7 @@ def test_existing_stops_fields_are_unchanged(fleet):
 def test_all_bus_routes_hides_another_students_custom_pin(fleet):
     fleet.db.add_all([
         Stop(id=90, route_id=1, name="Student A Custom Pin", latitude=18.1, longitude=79.6,
-             stop_order=4, is_custom=True, campus_id=1),
+             stop_order=4, is_custom=True),
         TemporaryStopChange(
             student_id=1,
             original_stop_id=2,
@@ -233,7 +229,6 @@ def test_all_bus_routes_hides_another_students_custom_pin(fleet):
             start_date=date.today(),
             end_date=date.today(),
             status="active",
-            campus_id=1,
         ),
     ])
     fleet.db.commit()
@@ -247,9 +242,9 @@ def test_all_bus_routes_hides_another_students_custom_pin(fleet):
 def test_my_route_stops_hides_other_passenger_pin_keeps_requesters_pin(fleet):
     fleet.db.add_all([
         Stop(id=91, route_id=1, name="Student A Custom Pin", latitude=18.11, longitude=79.61,
-             stop_order=4, is_custom=True, campus_id=1),
+             stop_order=4, is_custom=True),
         Stop(id=92, route_id=1, name="Student B Custom Pin", latitude=18.12, longitude=79.62,
-             stop_order=5, is_custom=True, campus_id=1),
+             stop_order=5, is_custom=True),
         TemporaryStopChange(
             student_id=1,
             original_stop_id=2,
@@ -259,7 +254,6 @@ def test_my_route_stops_hides_other_passenger_pin_keeps_requesters_pin(fleet):
             start_date=date.today(),
             end_date=date.today(),
             status="active",
-            campus_id=1,
         ),
         TemporaryStopChange(
             student_id=2,
@@ -270,7 +264,6 @@ def test_my_route_stops_hides_other_passenger_pin_keeps_requesters_pin(fleet):
             start_date=date.today(),
             end_date=date.today(),
             status="active",
-            campus_id=1,
         ),
     ])
     fleet.db.commit()
