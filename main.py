@@ -2055,6 +2055,53 @@ def get_my_bus(
     }
 
 
+def get_bus_map_stops(
+    db: Session,
+    bus: Bus,
+    regular_stops: list[Stop],
+    include_custom: bool = True,
+    requesting_student_id: int | None = None,
+) -> list[dict]:
+    """Map-only stop union; keep the existing trip-specific `stops` contract."""
+    stops_by_id = {stop.id: stop for stop in regular_stops}
+    directions = {stop.id: {"morning", "evening"} for stop in regular_stops}
+    affected = {}
+    skipped = {row[0] for row in db.query(TravelStatus.student_id).filter(
+        TravelStatus.date == date.today(), TravelStatus.status == "not_travelling"
+    ).all()}
+    for passenger in get_students_for_current_bus(db, bus.id):
+        if passenger.id in skipped:
+            continue
+        missed = get_active_missed_bus_allotment(db, passenger.id)
+        temporary = get_active_temporary_stop_change(db, passenger.id)
+        missed_trip = db.query(Trip).filter(Trip.id == missed.alternative_trip_id).first() if missed else None
+        for direction in ("morning", "evening"):
+            # A missed-bus assignment belongs to its active trip, not both trips.
+            if missed_trip and missed_trip.trip_type != direction:
+                continue
+            if not missed and temporary and _temporary_direction_stop_id(temporary, direction) is None:
+                continue
+            stop, change = get_effective_student_stop(db, passenger, direction)
+            if not stop or not stop.is_active:
+                continue
+            if stop.is_custom and (
+                not include_custom or passenger.id != requesting_student_id
+            ):
+                continue
+            stops_by_id[stop.id] = stop
+            directions.setdefault(stop.id, set()).add(direction)
+            if missed or change or passenger.bus_id != bus.id:
+                affected.setdefault(stop.id, set()).add(direction)
+    return [{
+        "stop_id": stop.id, "name": stop.name, "stop_order": stop.stop_order,
+        "latitude": stop.latitude, "longitude": stop.longitude,
+        "morning_latitude": stop.latitude, "morning_longitude": stop.longitude,
+        "evening_latitude": stop.evening_latitude, "evening_longitude": stop.evening_longitude,
+        "directions": sorted(directions[stop.id]),
+        "affected_directions": sorted(affected.get(stop.id, set())),
+    } for stop in sorted(stops_by_id.values(), key=lambda stop: (stop.stop_order, stop.id))]
+
+
 @app.get("/student/my-route-stops")
 def get_student_route_stops(
     db: Session = Depends(get_db),
@@ -2118,6 +2165,7 @@ def get_student_route_stops(
         "bus_number": bus.bus_number,
         "route_id": bus.route_id,
         "stops": [route_stop_payload(stop) for stop in stops_list],
+        "map_stops": get_bus_map_stops(db, bus, stops, requesting_student_id=student.id),
         "temporary_stop": _temporary_route_selection(db, student),
     }
 
@@ -2145,6 +2193,7 @@ def get_all_bus_routes(
             "bus_number": bus.bus_number,
             "route_id": bus.route_id,
             "route_name": route.name if route else None,
+            "map_stops": get_bus_map_stops(db, bus, stops, include_custom=False),
             "stops": [
                 {
                     "stop_id": s.id,
